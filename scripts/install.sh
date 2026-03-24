@@ -13,7 +13,7 @@ usage() {
 Install gstackqlite-hypervisor from a GitHub release.
 
 Usage:
-  install.sh [--repo owner/repo] [--version v0.1.0|latest] [--install-dir /path] [--no-path-update]
+  install.sh [--repo owner/repo] [--version v0.0.1|latest] [--install-dir /path] [--no-path-update]
 
 Environment:
   GSTACKQLITE_HYPERVISOR_REPO         GitHub repository slug, for example "owner/gstackqlite_hypervisor"

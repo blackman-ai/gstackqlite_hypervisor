@@ -65,7 +65,7 @@ cargo install --path . --bin gstackqlite-hypervisor
 For a public GitHub repo, the intended release flow is:
 
 - push normal branches and PRs to run CI
-- push a tag like `v0.1.0` to build release archives and publish a GitHub release
+- push a tag like `v0.0.1` to build release archives and publish a GitHub release
 - let users install from the release page or via the installer script
 
 Unix install command:
