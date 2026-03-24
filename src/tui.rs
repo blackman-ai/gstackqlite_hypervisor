@@ -48,6 +48,7 @@ enum InputMode {
 
 #[derive(Clone, Copy)]
 struct Theme {
+    id: &'static str,
     name: &'static str,
     accent: Color,
     accent_soft: Color,
@@ -57,6 +58,7 @@ struct Theme {
 
 const THEMES: [Theme; 4] = [
     Theme {
+        id: "sandhill_sandstone",
         name: "Sandhill Sandstone",
         accent: Color::Yellow,
         accent_soft: Color::LightYellow,
@@ -64,6 +66,7 @@ const THEMES: [Theme; 4] = [
         muted: Color::DarkGray,
     },
     Theme {
+        id: "singapore_harbor",
         name: "Singapore Harbor",
         accent: Color::Cyan,
         accent_soft: Color::LightCyan,
@@ -71,6 +74,7 @@ const THEMES: [Theme; 4] = [
         muted: Color::Blue,
     },
     Theme {
+        id: "bengaluru_garden",
         name: "Bengaluru Garden",
         accent: Color::Green,
         accent_soft: Color::LightGreen,
@@ -78,6 +82,7 @@ const THEMES: [Theme; 4] = [
         muted: Color::DarkGray,
     },
     Theme {
+        id: "shoreditch_neon",
         name: "Shoreditch Neon",
         accent: Color::Magenta,
         accent_soft: Color::LightMagenta,
@@ -85,6 +90,28 @@ const THEMES: [Theme; 4] = [
         muted: Color::DarkGray,
     },
 ];
+
+const UI_THEME_SETTING_KEY: &str = "tui.theme_id";
+const UI_TRACK_SETTING_KEY: &str = "tui.track_key";
+const UI_MUSIC_SETTING_KEY: &str = "tui.music_enabled";
+
+fn theme_index_by_id(theme_id: &str) -> Option<usize> {
+    THEMES.iter().position(|theme| theme.id == theme_id)
+}
+
+fn track_index_by_key(track_key: &str) -> Option<usize> {
+    TrackKind::all()
+        .iter()
+        .position(|track| track.storage_key() == track_key)
+}
+
+fn parse_setting_bool(value: &str) -> Option<bool> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "1" | "true" | "yes" | "on" => Some(true),
+        "0" | "false" | "no" | "off" => Some(false),
+        _ => None,
+    }
+}
 
 struct App {
     catalog: Catalog,
@@ -104,6 +131,7 @@ struct App {
     version_filter: String,
     theme_index: usize,
     track_index: usize,
+    music_enabled: bool,
     lofi: Option<LofiPlayer>,
     music_started_at: Option<Instant>,
     status: String,
@@ -131,10 +159,12 @@ impl App {
             version_filter: String::new(),
             theme_index: 0,
             track_index: 0,
+            music_enabled: true,
             lofi: None,
             music_started_at: None,
             status: "starting catalog bootstrap".to_string(),
         };
+        app.restore_ui_preferences()?;
         app.refresh()?;
         app.sync_on_boot();
         app.start_lofi_default();
@@ -147,6 +177,46 @@ impl App {
 
     fn current_track(&self) -> TrackKind {
         TrackKind::all()[self.track_index % TrackKind::all().len()]
+    }
+
+    fn restore_ui_preferences(&mut self) -> Result<()> {
+        if let Some(theme_id) = self.catalog.app_setting(UI_THEME_SETTING_KEY)? {
+            if let Some(index) = theme_index_by_id(&theme_id) {
+                self.theme_index = index;
+            }
+        }
+        if let Some(track_key) = self.catalog.app_setting(UI_TRACK_SETTING_KEY)? {
+            if let Some(index) = track_index_by_key(&track_key) {
+                self.track_index = index;
+            }
+        }
+        if let Some(value) = self.catalog.app_setting(UI_MUSIC_SETTING_KEY)? {
+            self.music_enabled = parse_setting_bool(&value).unwrap_or(true);
+        }
+        Ok(())
+    }
+
+    fn persist_ui_preferences(&mut self) {
+        if let Err(error) = self
+            .catalog
+            .set_app_setting(UI_THEME_SETTING_KEY, Some(self.current_theme().id))
+        {
+            self.status = format!("failed to save theme preference: {error}");
+            return;
+        }
+        if let Err(error) = self.catalog.set_app_setting(
+            UI_TRACK_SETTING_KEY,
+            Some(self.current_track().storage_key()),
+        ) {
+            self.status = format!("failed to save track preference: {error}");
+            return;
+        }
+        if let Err(error) = self.catalog.set_app_setting(
+            UI_MUSIC_SETTING_KEY,
+            Some(if self.music_enabled { "true" } else { "false" }),
+        ) {
+            self.status = format!("failed to save music preference: {error}");
+        }
     }
 
     fn current_filter(&self, focus: Focus) -> &str {
@@ -362,16 +432,21 @@ impl App {
     }
 
     fn start_lofi_default(&mut self) {
-        self.start_track(self.current_track(), "music on");
+        if self.music_enabled {
+            self.start_track(self.current_track(), "music on");
+        }
     }
 
     fn toggle_lofi(&mut self) {
         if self.lofi.take().is_some() {
+            self.music_enabled = false;
             self.music_started_at = None;
             self.status = "music off".to_string();
         } else {
+            self.music_enabled = true;
             self.start_track(self.current_track(), "music on");
         }
+        self.persist_ui_preferences();
     }
 
     fn cycle_track(&mut self) {
@@ -383,11 +458,13 @@ impl App {
         } else {
             self.status = format!("selected track: {}", track.name());
         }
+        self.persist_ui_preferences();
     }
 
     fn cycle_theme(&mut self) {
         self.theme_index = (self.theme_index + 1) % THEMES.len();
         self.status = format!("theme: {}", self.current_theme().name);
+        self.persist_ui_preferences();
     }
 
     fn selected_project(&self) -> Option<&CatalogProject> {

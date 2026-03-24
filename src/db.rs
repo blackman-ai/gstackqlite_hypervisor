@@ -174,6 +174,11 @@ impl Catalog {
               status TEXT NOT NULL,
               details_json TEXT NOT NULL
             );
+            CREATE TABLE IF NOT EXISTS app_settings (
+              key TEXT PRIMARY KEY,
+              value TEXT NOT NULL,
+              updated_at TEXT NOT NULL
+            );
             CREATE INDEX IF NOT EXISTS idx_upstream_commit_version ON upstream_commits(version);
             CREATE INDEX IF NOT EXISTS idx_upstream_commit_manifest_hash ON upstream_commits(manifest_hash);
             CREATE INDEX IF NOT EXISTS idx_local_installs_outdated ON local_installs(is_outdated);
@@ -1225,6 +1230,35 @@ impl Catalog {
         Ok(())
     }
 
+    pub fn app_setting(&self, key: &str) -> Result<Option<String>> {
+        self.conn
+            .query_row(
+                "SELECT value FROM app_settings WHERE key = ?1",
+                params![key],
+                |row| row.get(0),
+            )
+            .optional()
+            .with_context(|| format!("failed to read app setting {key}"))
+    }
+
+    pub fn set_app_setting(&self, key: &str, value: Option<&str>) -> Result<()> {
+        match value {
+            Some(value) => {
+                self.conn.execute(
+                    "INSERT INTO app_settings (key, value, updated_at)
+                     VALUES (?1, ?2, ?3)
+                     ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at",
+                    params![key, value, now_iso()],
+                )?;
+            }
+            None => {
+                self.conn
+                    .execute("DELETE FROM app_settings WHERE key = ?1", params![key])?;
+            }
+        }
+        Ok(())
+    }
+
     pub fn summary(&self) -> Result<CatalogSummary> {
         let source = self.source_state()?;
         let total_installs: i64 =
@@ -1274,5 +1308,33 @@ impl Catalog {
             by_type,
             last_scan_at,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Catalog;
+    use crate::util::TempWorkdir;
+
+    #[test]
+    fn app_settings_round_trip() {
+        let temp = TempWorkdir::new("gstack-hypervisor-db-test").expect("temp dir");
+        let db_path = temp.path().join("catalog.sqlite");
+        let catalog = Catalog::new(&db_path).expect("catalog");
+
+        assert_eq!(catalog.app_setting("tui.theme_id").expect("read"), None);
+
+        catalog
+            .set_app_setting("tui.theme_id", Some("shoreditch_neon"))
+            .expect("write");
+        assert_eq!(
+            catalog.app_setting("tui.theme_id").expect("read"),
+            Some("shoreditch_neon".to_string())
+        );
+
+        catalog
+            .set_app_setting("tui.theme_id", None)
+            .expect("delete");
+        assert_eq!(catalog.app_setting("tui.theme_id").expect("read"), None);
     }
 }
