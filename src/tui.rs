@@ -3,7 +3,7 @@ use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 use anyhow::Result;
-use crossterm::event::{self, Event, KeyCode};
+use crossterm::event::{self, Event, KeyCode, KeyModifiers};
 use crossterm::execute;
 use crossterm::terminal::{
     EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
@@ -31,6 +31,21 @@ enum Focus {
     Versions,
 }
 
+impl Focus {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Projects => "projects",
+            Self::Versions => "versions",
+        }
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum InputMode {
+    Normal,
+    Filtering(Focus),
+}
+
 #[derive(Clone, Copy)]
 struct Theme {
     name: &'static str,
@@ -42,28 +57,28 @@ struct Theme {
 
 const THEMES: [Theme; 4] = [
     Theme {
-        name: "Amber CRT",
+        name: "Sandhill Sandstone",
         accent: Color::Yellow,
         accent_soft: Color::LightYellow,
         text: Color::White,
         muted: Color::DarkGray,
     },
     Theme {
-        name: "Ocean",
+        name: "Singapore Harbor",
         accent: Color::Cyan,
         accent_soft: Color::LightCyan,
         text: Color::White,
         muted: Color::Blue,
     },
     Theme {
-        name: "Forest",
+        name: "Bengaluru Garden",
         accent: Color::Green,
         accent_soft: Color::LightGreen,
         text: Color::White,
         muted: Color::DarkGray,
     },
     Theme {
-        name: "Rose",
+        name: "Shoreditch Neon",
         accent: Color::Magenta,
         accent_soft: Color::LightMagenta,
         text: Color::White,
@@ -76,12 +91,17 @@ struct App {
     scan_roots: Vec<PathBuf>,
     summary: CatalogSummary,
     installs: Vec<CatalogInstall>,
+    all_projects: Vec<CatalogProject>,
     projects: Vec<CatalogProject>,
+    all_versions: Vec<CatalogVersion>,
     versions: Vec<CatalogVersion>,
     version_context: Option<CatalogVersionContext>,
     selected_project: usize,
     selected_version: usize,
     focus: Focus,
+    input_mode: InputMode,
+    project_filter: String,
+    version_filter: String,
     theme_index: usize,
     track_index: usize,
     lofi: Option<LofiPlayer>,
@@ -98,12 +118,17 @@ impl App {
             scan_roots,
             summary,
             installs: Vec::new(),
+            all_projects: Vec::new(),
             projects: Vec::new(),
+            all_versions: Vec::new(),
             versions: Vec::new(),
             version_context: None,
             selected_project: 0,
             selected_version: 0,
             focus: Focus::Projects,
+            input_mode: InputMode::Normal,
+            project_filter: String::new(),
+            version_filter: String::new(),
             theme_index: 0,
             track_index: 0,
             lofi: None,
@@ -122,6 +147,20 @@ impl App {
 
     fn current_track(&self) -> TrackKind {
         TrackKind::all()[self.track_index % TrackKind::all().len()]
+    }
+
+    fn current_filter(&self, focus: Focus) -> &str {
+        match focus {
+            Focus::Projects => &self.project_filter,
+            Focus::Versions => &self.version_filter,
+        }
+    }
+
+    fn current_filter_mut(&mut self, focus: Focus) -> &mut String {
+        match focus {
+            Focus::Projects => &mut self.project_filter,
+            Focus::Versions => &mut self.version_filter,
+        }
     }
 
     fn has_cached_catalog(&self) -> bool {
@@ -155,16 +194,30 @@ impl App {
     fn refresh(&mut self) -> Result<()> {
         self.summary = self.catalog.summary()?;
         self.installs = self.catalog.list_installs(false, None, None)?;
-        self.projects = self.catalog.list_projects()?;
-        self.versions = self.catalog.list_versions(None).unwrap_or_default();
-        if self.selected_project >= self.projects.len() {
-            self.selected_project = self.projects.len().saturating_sub(1);
-        }
-        if self.selected_version >= self.versions.len() {
-            self.selected_version = self.versions.len().saturating_sub(1);
-        }
-        self.refresh_version_context()?;
-        Ok(())
+        self.all_projects = self.catalog.list_projects()?;
+        self.all_versions = self.catalog.list_versions(None).unwrap_or_default();
+        self.apply_filters()
+    }
+
+    fn apply_filters(&mut self) -> Result<()> {
+        let selected_project_id = self.selected_project().map(|project| project.id);
+        let selected_version_sha = self
+            .selected_version()
+            .map(|version| version.commit_sha.clone());
+        let previous_project_index = self.selected_project;
+        let previous_version_index = self.selected_version;
+
+        self.projects = filter_projects(&self.all_projects, &self.project_filter);
+        self.versions = filter_versions(&self.all_versions, &self.version_filter);
+
+        self.selected_project =
+            restore_project_selection(&self.projects, selected_project_id, previous_project_index);
+        self.selected_version = restore_version_selection(
+            &self.versions,
+            selected_version_sha.as_deref(),
+            previous_version_index,
+        );
+        self.refresh_version_context()
     }
 
     fn refresh_version_context(&mut self) -> Result<()> {
@@ -198,6 +251,57 @@ impl App {
             }
         }
         let _ = self.refresh();
+    }
+
+    fn begin_filter(&mut self) {
+        self.input_mode = InputMode::Filtering(self.focus);
+        self.status = format!(
+            "filtering {}: type to search, enter or esc to finish, ctrl+u to clear",
+            self.focus.label()
+        );
+    }
+
+    fn finish_filter(&mut self, focus: Focus) {
+        self.input_mode = InputMode::Normal;
+        let filter = self.current_filter(focus).trim();
+        self.status = if filter.is_empty() {
+            format!("{} filter cleared", focus.label())
+        } else {
+            format!("{} filter active: {}", focus.label(), filter)
+        };
+    }
+
+    fn clear_filter(&mut self, focus: Focus) {
+        self.current_filter_mut(focus).clear();
+        if let Err(error) = self.apply_filters() {
+            self.status = format!("failed to clear {} filter: {error}", focus.label());
+            return;
+        }
+        self.status = format!("{} filter cleared", focus.label());
+    }
+
+    fn push_filter_char(&mut self, focus: Focus, ch: char) {
+        self.current_filter_mut(focus).push(ch);
+        if let Err(error) = self.apply_filters() {
+            self.status = format!("failed to update {} filter: {error}", focus.label());
+            return;
+        }
+        let filter = self.current_filter(focus).trim();
+        self.status = format!("{} filter: {}", focus.label(), filter);
+    }
+
+    fn pop_filter_char(&mut self, focus: Focus) {
+        self.current_filter_mut(focus).pop();
+        if let Err(error) = self.apply_filters() {
+            self.status = format!("failed to update {} filter: {error}", focus.label());
+            return;
+        }
+        let filter = self.current_filter(focus).trim();
+        self.status = if filter.is_empty() {
+            format!("{} filter cleared", focus.label())
+        } else {
+            format!("{} filter: {}", focus.label(), filter)
+        };
     }
 
     fn apply_selected(&mut self, dry_run: bool) {
@@ -394,13 +498,150 @@ fn render_list<'a>(
     (list, state)
 }
 
+fn trim_query(query: &str) -> &str {
+    query.trim()
+}
+
+fn matches_query(fields: &[String], query: &str) -> bool {
+    let terms = query
+        .split_whitespace()
+        .map(|term| term.to_ascii_lowercase())
+        .filter(|term| !term.is_empty())
+        .collect::<Vec<_>>();
+    if terms.is_empty() {
+        return true;
+    }
+    let haystack = fields.join("\n").to_ascii_lowercase();
+    terms.iter().all(|term| haystack.contains(term))
+}
+
+fn filter_projects(projects: &[CatalogProject], query: &str) -> Vec<CatalogProject> {
+    let query = trim_query(query);
+    if query.is_empty() {
+        return projects.to_vec();
+    }
+    projects
+        .iter()
+        .filter(|project| {
+            matches_query(
+                &[
+                    project.id.to_string(),
+                    project.name.clone(),
+                    project.canonical_path.clone(),
+                    project
+                        .effective_gstack_version
+                        .clone()
+                        .unwrap_or_else(|| "unknown".to_string()),
+                    project.effective_gstack_source.clone(),
+                    project
+                        .gstack_install_observed_path
+                        .clone()
+                        .unwrap_or_default(),
+                    project.claude_settings_paths.join(" "),
+                ],
+                query,
+            )
+        })
+        .cloned()
+        .collect()
+}
+
+fn filter_versions(versions: &[CatalogVersion], query: &str) -> Vec<CatalogVersion> {
+    let query = trim_query(query);
+    if query.is_empty() {
+        return versions.to_vec();
+    }
+    versions
+        .iter()
+        .filter(|version| {
+            matches_query(
+                &[
+                    version.version.clone(),
+                    version.commit_sha.clone(),
+                    version.committed_at.clone(),
+                    version.subject.clone(),
+                    version.body.clone(),
+                ],
+                query,
+            )
+        })
+        .cloned()
+        .collect()
+}
+
+fn restore_project_selection(
+    projects: &[CatalogProject],
+    selected_project_id: Option<i64>,
+    previous_index: usize,
+) -> usize {
+    if projects.is_empty() {
+        return 0;
+    }
+    selected_project_id
+        .and_then(|project_id| projects.iter().position(|project| project.id == project_id))
+        .unwrap_or_else(|| previous_index.min(projects.len().saturating_sub(1)))
+}
+
+fn restore_version_selection(
+    versions: &[CatalogVersion],
+    selected_commit_sha: Option<&str>,
+    previous_index: usize,
+) -> usize {
+    if versions.is_empty() {
+        return 0;
+    }
+    selected_commit_sha
+        .and_then(|commit_sha| {
+            versions
+                .iter()
+                .position(|version| version.commit_sha == commit_sha)
+        })
+        .unwrap_or_else(|| previous_index.min(versions.len().saturating_sub(1)))
+}
+
+fn truncate_inline(value: &str, max_chars: usize) -> String {
+    let trimmed = value.trim();
+    let count = trimmed.chars().count();
+    if count <= max_chars {
+        return trimmed.to_string();
+    }
+    let mut truncated = trimmed
+        .chars()
+        .take(max_chars.saturating_sub(1))
+        .collect::<String>();
+    truncated.push('…');
+    truncated
+}
+
+fn display_filter(filter: &str) -> String {
+    let filter = trim_query(filter);
+    if filter.is_empty() {
+        "-".to_string()
+    } else {
+        truncate_inline(filter, 20)
+    }
+}
+
+fn pane_title(base: &str, visible: usize, total: usize, filter: &str, editing: bool) -> String {
+    let mut title = format!("{base} {visible}/{total}");
+    let filter = trim_query(filter);
+    if !filter.is_empty() {
+        title.push_str(" | /");
+        title.push_str(&truncate_inline(filter, 18));
+    }
+    if editing {
+        title.push_str(" *");
+    }
+    title
+}
+
 fn render(app: &mut App, terminal: &mut Terminal<CrosstermBackend<Stdout>>) -> Result<()> {
     terminal.draw(|frame| {
         let theme = app.current_theme();
         let areas = Layout::default()
             .direction(Direction::Vertical)
             .constraints([
-                Constraint::Length(6),
+                Constraint::Length(8),
                 Constraint::Min(12),
                 Constraint::Length(11),
             ])
@@ -462,7 +703,20 @@ fn render(app: &mut App, terminal: &mut Terminal<CrosstermBackend<Stdout>>) -> R
                 if app.lofi.is_some() { "on" } else { "off" }
             )),
             Line::from(
-                "Keys: q quit | g sync | m music | t track | c theme | tab switch | j/k move | d dry-run | a apply | r refresh",
+                format!(
+                    "Search: projects=/{}, versions=/{}{}",
+                    display_filter(&app.project_filter),
+                    display_filter(&app.version_filter),
+                    match app.input_mode {
+                        InputMode::Filtering(focus) => {
+                            format!("  editing {}", focus.label())
+                        }
+                        InputMode::Normal => String::new(),
+                    }
+                ),
+            ),
+            Line::from(
+                "Keys: q quit | g sync | / filter | f clear | m music | t track | c theme | tab switch | j/k move | d dry-run | a apply | r refresh",
             ),
             Line::from(Span::styled(
                 app.status.clone(),
@@ -508,8 +762,15 @@ fn render(app: &mut App, terminal: &mut Terminal<CrosstermBackend<Stdout>>) -> R
                 })
                 .collect::<Vec<_>>()
         };
-        let (projects_list, mut projects_state) = render_list(
+        let projects_title = pane_title(
             "Projects",
+            app.projects.len(),
+            app.all_projects.len(),
+            &app.project_filter,
+            app.input_mode == InputMode::Filtering(Focus::Projects),
+        );
+        let (projects_list, mut projects_state) = render_list(
+            &projects_title,
             project_items,
             (!app.projects.is_empty()).then_some(app.selected_project),
             app.focus == Focus::Projects,
@@ -527,13 +788,20 @@ fn render(app: &mut App, terminal: &mut Terminal<CrosstermBackend<Stdout>>) -> R
                         "{} {} {}",
                         version.version,
                         version.commit_sha.chars().take(12).collect::<String>(),
-                        version.committed_at
+                        truncate_inline(&version.subject, 44)
                     ))
                 })
                 .collect::<Vec<_>>()
         };
-        let (versions_list, mut versions_state) = render_list(
+        let versions_title = pane_title(
             "Versions",
+            app.versions.len(),
+            app.all_versions.len(),
+            &app.version_filter,
+            app.input_mode == InputMode::Filtering(Focus::Versions),
+        );
+        let (versions_list, mut versions_state) = render_list(
+            &versions_title,
             version_items,
             (!app.versions.is_empty()).then_some(app.selected_version),
             app.focus == Focus::Versions,
@@ -828,23 +1096,41 @@ fn run_loop(app: &mut App, terminal: &mut Terminal<CrosstermBackend<Stdout>>) ->
         render(app, terminal)?;
         if event::poll(Duration::from_millis(200))? {
             if let Event::Key(key) = event::read()? {
-                match key.code {
-                    KeyCode::Char('q') => break,
-                    KeyCode::Char('g') => app.sync_now(),
-                    KeyCode::Char('m') => app.toggle_lofi(),
-                    KeyCode::Char('t') => app.cycle_track(),
-                    KeyCode::Char('c') => app.cycle_theme(),
-                    KeyCode::Char('a') => app.apply_selected(false),
-                    KeyCode::Char('d') => app.apply_selected(true),
-                    KeyCode::Char('r') => {
-                        if let Err(error) = app.refresh() {
-                            app.status = format!("refresh failed: {error}");
+                match app.input_mode {
+                    InputMode::Normal => match key.code {
+                        KeyCode::Char('q') => break,
+                        KeyCode::Char('g') => app.sync_now(),
+                        KeyCode::Char('/') => app.begin_filter(),
+                        KeyCode::Char('f') => app.clear_filter(app.focus),
+                        KeyCode::Char('m') => app.toggle_lofi(),
+                        KeyCode::Char('t') => app.cycle_track(),
+                        KeyCode::Char('c') => app.cycle_theme(),
+                        KeyCode::Char('a') => app.apply_selected(false),
+                        KeyCode::Char('d') => app.apply_selected(true),
+                        KeyCode::Char('r') => {
+                            if let Err(error) = app.refresh() {
+                                app.status = format!("refresh failed: {error}");
+                            }
                         }
-                    }
-                    KeyCode::Tab => app.toggle_focus(),
-                    KeyCode::Down | KeyCode::Char('j') => app.next(),
-                    KeyCode::Up | KeyCode::Char('k') => app.previous(),
-                    _ => {}
+                        KeyCode::Tab => app.toggle_focus(),
+                        KeyCode::Down | KeyCode::Char('j') => app.next(),
+                        KeyCode::Up | KeyCode::Char('k') => app.previous(),
+                        _ => {}
+                    },
+                    InputMode::Filtering(focus) => match key.code {
+                        KeyCode::Enter | KeyCode::Esc => app.finish_filter(focus),
+                        KeyCode::Backspace => app.pop_filter_char(focus),
+                        KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                            app.clear_filter(focus)
+                        }
+                        KeyCode::Char(ch)
+                            if !key.modifiers.contains(KeyModifiers::CONTROL)
+                                && !key.modifiers.contains(KeyModifiers::ALT) =>
+                        {
+                            app.push_filter_char(focus, ch)
+                        }
+                        _ => {}
+                    },
                 }
             }
         }
@@ -858,4 +1144,93 @@ pub fn run(catalog: Catalog) -> Result<()> {
     let loop_result = run_loop(&mut app, &mut terminal);
     let restore_result = restore_terminal(terminal);
     loop_result.and(restore_result)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{filter_projects, filter_versions};
+    use crate::models::{CatalogProject, CatalogVersion};
+
+    fn sample_project(
+        id: i64,
+        name: &str,
+        path: &str,
+        version: Option<&str>,
+        source: &str,
+    ) -> CatalogProject {
+        CatalogProject {
+            id,
+            canonical_path: path.to_string(),
+            name: name.to_string(),
+            git_remote: None,
+            has_claude_md: false,
+            has_claude_dir: true,
+            has_claude_settings: true,
+            claude_settings_paths: vec![format!("{path}/.claude/settings.local.json")],
+            gstack_install_id: None,
+            gstack_install_observed_path: Some(format!("{path}/.claude/skills/gstack")),
+            effective_gstack_version: version.map(ToOwned::to_owned),
+            effective_gstack_source: source.to_string(),
+            first_seen_at: "2026-03-23T00:00:00Z".to_string(),
+            last_seen_at: "2026-03-23T00:00:00Z".to_string(),
+        }
+    }
+
+    fn sample_version(version: &str, sha: &str, subject: &str, body: &str) -> CatalogVersion {
+        CatalogVersion {
+            version: version.to_string(),
+            commit_sha: sha.to_string(),
+            committed_at: "2026-03-23T00:00:00Z".to_string(),
+            subject: subject.to_string(),
+            body: body.to_string(),
+        }
+    }
+
+    #[test]
+    fn project_filter_matches_name_path_and_version() {
+        let projects = vec![
+            sample_project(
+                1,
+                "jenkins-chat",
+                "/Users/example/Work/jenkins-chat",
+                Some("0.8.6"),
+                "local_install",
+            ),
+            sample_project(
+                2,
+                "startup_world",
+                "/Users/example/Work/startup_world",
+                Some("0.11.10.0"),
+                "none",
+            ),
+        ];
+
+        assert_eq!(filter_projects(&projects, "jenkins").len(), 1);
+        assert_eq!(filter_projects(&projects, "startup 0.11.10").len(), 1);
+        assert_eq!(filter_projects(&projects, "Work local_install").len(), 1);
+        assert!(filter_projects(&projects, "missing value").is_empty());
+    }
+
+    #[test]
+    fn version_filter_matches_version_sha_subject_and_body() {
+        let versions = vec![
+            sample_version(
+                "0.11.10.0",
+                "f4bbfaa5bdfd1234",
+                "feat: CI evals on Ubicloud",
+                "Adds 12 parallel runners and a docker image.",
+            ),
+            sample_version(
+                "0.11.9.0",
+                "ffd9ab29b9321234",
+                "fix: tighten terminal refresh",
+                "Cleans up rendering and search state.",
+            ),
+        ];
+
+        assert_eq!(filter_versions(&versions, "0.11.10").len(), 1);
+        assert_eq!(filter_versions(&versions, "f4bbfaa5 feat").len(), 1);
+        assert_eq!(filter_versions(&versions, "docker runners").len(), 1);
+        assert!(filter_versions(&versions, "rollback only").is_empty());
+    }
 }

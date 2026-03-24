@@ -33,7 +33,7 @@ It treats Git as an ingestion transport only:
 - startup sync on TUI launch
 - project-centric version browser and apply flow
 - merge-aware apply with backup retention for local customizations
-- optional generated lo-fi loop for the TUI
+- optional generated lo-fi loop for the TUI, with startup-hub themed tracks and terminal palettes
 
 ## Build
 
@@ -126,10 +126,14 @@ cargo run -- upgrade --outdated
 - `q`: quit
 - `g`: sync upstream plus local project/install state
 - `tab`: switch between the project list and version list
+- `/`: start filtering the focused list
+- `f`: clear the focused list filter
 - `j` / `k`: move selection
 - `d`: dry-run apply of the selected version to the selected project
 - `a`: apply the selected version to the selected project
 - `m`: toggle the generated lo-fi loop
+- `t`: cycle tracks (`Palo Alto Dawn`, `SoMa Afterhours`, `Shibuya Rain`)
+- `c`: cycle terminal themes (`Sandhill Sandstone`, `Singapore Harbor`, `Bengaluru Garden`, `Shoreditch Neon`)
 - `r`: refresh the catalog view
 
 ## Storage

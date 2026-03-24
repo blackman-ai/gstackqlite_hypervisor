@@ -23,9 +23,9 @@ impl TrackKind {
 
     pub fn name(self) -> &'static str {
         match self {
-            Self::TapeBloom => "Tape Bloom",
-            Self::NightDrive => "Night Drive",
-            Self::RainStudy => "Rain Study",
+            Self::TapeBloom => "Palo Alto Dawn",
+            Self::NightDrive => "SoMa Afterhours",
+            Self::RainStudy => "Shibuya Rain",
         }
     }
 
