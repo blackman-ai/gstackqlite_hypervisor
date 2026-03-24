@@ -270,6 +270,31 @@ pub struct CatalogVersion {
     pub commit_sha: String,
     pub committed_at: String,
     pub subject: String,
+    pub body: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CatalogCommitNote {
+    pub commit_sha: String,
+    pub version: Option<String>,
+    pub committed_at: String,
+    pub subject: String,
+    pub body: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CatalogCommitDiff {
+    pub added_paths: Vec<String>,
+    pub updated_paths: Vec<String>,
+    pub removed_paths: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CatalogVersionContext {
+    pub selected: CatalogCommitNote,
+    pub direction: String,
+    pub path_commits: Vec<CatalogCommitNote>,
+    pub diff: CatalogCommitDiff,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

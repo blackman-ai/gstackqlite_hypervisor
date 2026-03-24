@@ -6,10 +6,10 @@ use serde_json::{Value, json};
 
 use crate::config::{DEFAULT_SOURCE_NAME, DEFAULT_UPSTREAM_REF, DEFAULT_UPSTREAM_URL};
 use crate::models::{
-    CatalogInstall, CatalogObservation, CatalogProject, CatalogSummary, CatalogSyncEvent,
-    CatalogVersion, CommitSnapshotFile, DiscoveredInstall, DiscoveredProject, HostKind,
-    InstallDetail, InstallType, ProjectDetail, ScanResult, SourceState, UpstreamCommitRecord,
-    UpstreamTreeEntry,
+    CatalogCommitDiff, CatalogCommitNote, CatalogInstall, CatalogObservation, CatalogProject,
+    CatalogSummary, CatalogSyncEvent, CatalogVersion, CatalogVersionContext, CommitSnapshotFile,
+    DiscoveredInstall, DiscoveredProject, HostKind, InstallDetail, InstallType, ProjectDetail,
+    ScanResult, SourceState, UpstreamCommitRecord, UpstreamTreeEntry,
 };
 use crate::util::{ensure_dir, now_iso};
 
@@ -980,16 +980,170 @@ impl Catalog {
         Ok(Some((install_id, path)))
     }
 
+    fn commit_note_row(&self, sha: &str) -> Result<Option<(CatalogCommitNote, Vec<String>)>> {
+        self.conn
+            .query_row(
+                "SELECT sha, version, committed_at, subject, body, parents_json
+                 FROM upstream_commits
+                 WHERE sha = ?1",
+                params![sha],
+                |row| {
+                    let parents_json: String = row.get(5)?;
+                    let parents: Vec<String> =
+                        serde_json::from_str(&parents_json).unwrap_or_default();
+                    Ok((
+                        CatalogCommitNote {
+                            commit_sha: row.get(0)?,
+                            version: row.get(1)?,
+                            committed_at: row.get(2)?,
+                            subject: row.get(3)?,
+                            body: row.get(4)?,
+                        },
+                        parents,
+                    ))
+                },
+            )
+            .optional()
+            .map_err(Into::into)
+    }
+
+    pub fn commit_note(&self, sha: &str) -> Result<Option<CatalogCommitNote>> {
+        Ok(self.commit_note_row(sha)?.map(|(note, _)| note))
+    }
+
+    fn walk_first_parent_path(
+        &self,
+        start_sha: &str,
+        stop_sha: &str,
+        max_commits: usize,
+    ) -> Result<(Vec<CatalogCommitNote>, bool)> {
+        let mut commits = Vec::new();
+        let mut current = Some(start_sha.to_string());
+        let mut reached_stop = false;
+
+        while let Some(sha) = current {
+            if commits.len() >= max_commits {
+                break;
+            }
+            let Some((note, parents)) = self.commit_note_row(&sha)? else {
+                break;
+            };
+            if note.commit_sha == stop_sha {
+                reached_stop = true;
+                break;
+            }
+            current = parents.first().cloned();
+            commits.push(note);
+        }
+
+        Ok((commits, reached_stop))
+    }
+
+    fn diff_commit_files(&self, from_sha: Option<&str>, to_sha: &str) -> Result<CatalogCommitDiff> {
+        let from_files = if let Some(from_sha) = from_sha {
+            self.commit_files(from_sha)?
+        } else {
+            Vec::new()
+        };
+        let to_files = self.commit_files(to_sha)?;
+
+        let from_map = from_files
+            .iter()
+            .map(|file| (file.path.clone(), file))
+            .collect::<std::collections::HashMap<_, _>>();
+        let to_map = to_files
+            .iter()
+            .map(|file| (file.path.clone(), file))
+            .collect::<std::collections::HashMap<_, _>>();
+
+        let mut added_paths = Vec::new();
+        let mut updated_paths = Vec::new();
+        let mut removed_paths = Vec::new();
+
+        for (path, target) in &to_map {
+            match from_map.get(path) {
+                None => added_paths.push(path.clone()),
+                Some(source)
+                    if source.blob_sha != target.blob_sha || source.mode != target.mode =>
+                {
+                    updated_paths.push(path.clone())
+                }
+                Some(_) => {}
+            }
+        }
+
+        for path in from_map.keys() {
+            if !to_map.contains_key(path) {
+                removed_paths.push(path.clone());
+            }
+        }
+
+        added_paths.sort();
+        updated_paths.sort();
+        removed_paths.sort();
+
+        Ok(CatalogCommitDiff {
+            added_paths,
+            updated_paths,
+            removed_paths,
+        })
+    }
+
+    pub fn version_context(
+        &self,
+        current_commit_sha: Option<&str>,
+        target_commit_sha: &str,
+        max_commits: usize,
+    ) -> Result<Option<CatalogVersionContext>> {
+        let Some(selected) = self.commit_note(target_commit_sha)? else {
+            return Ok(None);
+        };
+
+        let (direction, path_commits) = match current_commit_sha {
+            None => ("preview".to_string(), vec![selected.clone()]),
+            Some(current_sha) if current_sha == target_commit_sha => {
+                ("current".to_string(), vec![])
+            }
+            Some(current_sha) => {
+                let (mut upgrade_path, reached_current) =
+                    self.walk_first_parent_path(target_commit_sha, current_sha, max_commits)?;
+                if reached_current {
+                    upgrade_path.reverse();
+                    ("upgrade".to_string(), upgrade_path)
+                } else {
+                    let (mut downgrade_path, reached_target) =
+                        self.walk_first_parent_path(current_sha, target_commit_sha, max_commits)?;
+                    if reached_target {
+                        downgrade_path.reverse();
+                        ("downgrade".to_string(), downgrade_path)
+                    } else {
+                        ("unrelated".to_string(), vec![selected.clone()])
+                    }
+                }
+            }
+        };
+
+        let diff = self.diff_commit_files(current_commit_sha, target_commit_sha)?;
+
+        Ok(Some(CatalogVersionContext {
+            selected,
+            direction,
+            path_commits,
+            diff,
+        }))
+    }
+
     pub fn list_versions(&self, search: Option<&str>) -> Result<Vec<CatalogVersion>> {
         let like = search.map(|value| format!("%{value}%"));
         let sql = if like.is_some() {
-            "SELECT version, sha, committed_at, subject
+            "SELECT version, sha, committed_at, subject, body
              FROM (
                 SELECT
                     version,
                     sha,
                     committed_at,
                     subject,
+                    body,
                     ROW_NUMBER() OVER (
                         PARTITION BY version
                         ORDER BY committed_at DESC, sha DESC
@@ -1001,13 +1155,14 @@ impl Catalog {
              WHERE row_number = 1
              ORDER BY committed_at DESC"
         } else {
-            "SELECT version, sha, committed_at, subject
+            "SELECT version, sha, committed_at, subject, body
              FROM (
                 SELECT
                     version,
                     sha,
                     committed_at,
                     subject,
+                    body,
                     ROW_NUMBER() OVER (
                         PARTITION BY version
                         ORDER BY committed_at DESC, sha DESC
@@ -1025,6 +1180,7 @@ impl Catalog {
                 commit_sha: row.get(1)?,
                 committed_at: row.get(2)?,
                 subject: row.get(3)?,
+                body: row.get(4)?,
             })
         };
         let rows = if let Some(like) = like {
