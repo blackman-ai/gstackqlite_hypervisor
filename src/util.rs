@@ -1,10 +1,13 @@
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 
 use crate::config;
+
+static TEMP_WORKDIR_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 pub fn ensure_dir(path: &Path) -> Result<()> {
     fs::create_dir_all(path)
@@ -90,13 +93,27 @@ pub struct TempWorkdir {
 
 impl TempWorkdir {
     pub fn new(prefix: &str) -> Result<Self> {
-        let path = std::env::temp_dir().join(format!(
-            "{prefix}-{}-{}",
-            std::process::id(),
-            timestamp_slug()
-        ));
-        ensure_dir(&path)?;
-        Ok(Self { path })
+        let temp_root = std::env::temp_dir();
+
+        for _ in 0..64 {
+            let path = temp_root.join(format!(
+                "{prefix}-{}-{}-{}",
+                std::process::id(),
+                timestamp_slug(),
+                TEMP_WORKDIR_COUNTER.fetch_add(1, Ordering::Relaxed)
+            ));
+            match fs::create_dir(&path) {
+                Ok(()) => return Ok(Self { path }),
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                Err(error) => {
+                    return Err(error).with_context(|| {
+                        format!("failed to create temp workdir {}", path.display())
+                    });
+                }
+            }
+        }
+
+        bail!("failed to allocate unique temp workdir for prefix {prefix}")
     }
 
     pub fn path(&self) -> &Path {
@@ -107,5 +124,20 @@ impl TempWorkdir {
 impl Drop for TempWorkdir {
     fn drop(&mut self) {
         let _ = fs::remove_dir_all(&self.path);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::TempWorkdir;
+
+    #[test]
+    fn temp_workdirs_are_unique() {
+        let first = TempWorkdir::new("gstackqlite-hypervisor-util-test").expect("first temp dir");
+        let second = TempWorkdir::new("gstackqlite-hypervisor-util-test").expect("second temp dir");
+
+        assert_ne!(first.path(), second.path());
+        assert!(first.path().exists());
+        assert!(second.path().exists());
     }
 }

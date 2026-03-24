@@ -35,11 +35,18 @@ fn run(cwd: &Path, args: &[&str]) -> Result<String> {
     Ok(String::from_utf8(output.stdout)?.trim().to_string())
 }
 
+fn configure_test_repo(repo_dir: &Path) -> Result<()> {
+    run(repo_dir, &["config", "user.name", "Test User"])?;
+    run(repo_dir, &["config", "user.email", "test@example.com"])?;
+    run(repo_dir, &["config", "commit.gpgsign", "false"])?;
+    run(repo_dir, &["config", "tag.gpgsign", "false"])?;
+    Ok(())
+}
+
 fn init_fixture_repo(repo_dir: &Path) -> Result<(String, String)> {
     fs::create_dir_all(repo_dir)?;
     run(repo_dir, &["init"])?;
-    run(repo_dir, &["config", "user.name", "Test User"])?;
-    run(repo_dir, &["config", "user.email", "test@example.com"])?;
+    configure_test_repo(repo_dir)?;
     fs::create_dir_all(repo_dir.join("docs"))?;
     fs::write(repo_dir.join("VERSION"), "0.0.1.0\n")?;
     fs::write(repo_dir.join("README.md"), "# fixture v1\n")?;
@@ -78,8 +85,7 @@ fn ingest_scan_and_upgrade_work_end_to_end() -> Result<()> {
 
     fs::create_dir_all(&project_repo)?;
     run(&project_repo, &["init"])?;
-    run(&project_repo, &["config", "user.name", "Test User"])?;
-    run(&project_repo, &["config", "user.email", "test@example.com"])?;
+    configure_test_repo(&project_repo)?;
     fs::create_dir_all(install_dir.join("docs"))?;
     fs::write(install_dir.join("VERSION"), "0.0.1.0\n")?;
     fs::write(install_dir.join("README.md"), "# fixture v1\n")?;
@@ -140,8 +146,7 @@ fn project_catalog_and_merge_aware_apply_work_end_to_end() -> Result<()> {
 
     fs::create_dir_all(&project_repo)?;
     run(&project_repo, &["init"])?;
-    run(&project_repo, &["config", "user.name", "Test User"])?;
-    run(&project_repo, &["config", "user.email", "test@example.com"])?;
+    configure_test_repo(&project_repo)?;
     fs::write(
         project_repo.join("CLAUDE.md"),
         "## gstack\nUse local skills.\n",
@@ -278,8 +283,7 @@ fn diff_preview_and_targeted_revert_work_end_to_end() -> Result<()> {
 
     fs::create_dir_all(&project_repo)?;
     run(&project_repo, &["init"])?;
-    run(&project_repo, &["config", "user.name", "Test User"])?;
-    run(&project_repo, &["config", "user.email", "test@example.com"])?;
+    configure_test_repo(&project_repo)?;
     fs::write(project_repo.join("CLAUDE.md"), "Use local skills.\n")?;
     fs::create_dir_all(project_repo.join(".claude"))?;
     fs::create_dir_all(install_dir.join("docs"))?;
@@ -367,8 +371,7 @@ fn codex_project_markers_are_detected() -> Result<()> {
 
     fs::create_dir_all(&project_repo)?;
     run(&project_repo, &["init"])?;
-    run(&project_repo, &["config", "user.name", "Test User"])?;
-    run(&project_repo, &["config", "user.email", "test@example.com"])?;
+    configure_test_repo(&project_repo)?;
     fs::write(
         project_repo.join("AGENTS.md"),
         "# Agents\nUse Codex for local workflows.\n",
@@ -432,8 +435,7 @@ fn plain_git_repos_are_cataloged_and_ready_for_install() -> Result<()> {
 
     fs::create_dir_all(&project_repo)?;
     run(&project_repo, &["init"])?;
-    run(&project_repo, &["config", "user.name", "Test User"])?;
-    run(&project_repo, &["config", "user.email", "test@example.com"])?;
+    configure_test_repo(&project_repo)?;
     fs::write(project_repo.join("README.md"), "# plain repo\n")?;
     run(&project_repo, &["add", "README.md"])?;
     run(&project_repo, &["commit", "-m", "plain repo init"])?;
