@@ -959,6 +959,62 @@ impl Catalog {
         }))
     }
 
+    pub fn sync_event(&self, event_id: i64) -> Result<Option<CatalogSyncEvent>> {
+        self.conn
+            .query_row(
+                "SELECT id, commit_sha, version, created_at, dry_run, changed_files_json, backup_path, status, details_json
+                 FROM sync_events
+                 WHERE id = ?1",
+                params![event_id],
+                |row| {
+                    let changed_files_json: String = row.get(5)?;
+                    let details_json: String = row.get(8)?;
+                    Ok(CatalogSyncEvent {
+                        id: row.get(0)?,
+                        commit_sha: row.get(1)?,
+                        version: row.get(2)?,
+                        created_at: row.get(3)?,
+                        dry_run: row.get::<_, i64>(4)? != 0,
+                        changed_files: serde_json::from_str(&changed_files_json)
+                            .unwrap_or_default(),
+                        backup_path: row.get(6)?,
+                        status: row.get(7)?,
+                        details: serde_json::from_str(&details_json).unwrap_or(Value::Null),
+                    })
+                },
+            )
+            .optional()
+            .map_err(Into::into)
+    }
+
+    pub fn project_backup_history(
+        &self,
+        identifier: &str,
+        limit: usize,
+    ) -> Result<Vec<CatalogSyncEvent>> {
+        let Some(project_detail) = self.project_detail(identifier)? else {
+            return Ok(Vec::new());
+        };
+        let install_identifier = if let Some(install) = project_detail.install {
+            install.id.to_string()
+        } else if let Some((install_id, _)) =
+            self.latest_project_install_history(project_detail.project.id)?
+        {
+            install_id.to_string()
+        } else {
+            return Ok(Vec::new());
+        };
+        let Some(detail) = self.install_detail(&install_identifier)? else {
+            return Ok(Vec::new());
+        };
+        Ok(detail
+            .sync_events
+            .into_iter()
+            .filter(|event| event.backup_path.is_some())
+            .take(limit)
+            .collect::<Vec<_>>())
+    }
+
     pub fn list_projects(&self) -> Result<Vec<CatalogProject>> {
         let mut statement = self.conn.prepare(
             "SELECT
@@ -1390,7 +1446,7 @@ mod tests {
 
     #[test]
     fn app_settings_round_trip() {
-        let temp = TempWorkdir::new("gstack-hypervisor-db-test").expect("temp dir");
+        let temp = TempWorkdir::new("gstackqlite-hypervisor-db-test").expect("temp dir");
         let db_path = temp.path().join("catalog.sqlite");
         let catalog = Catalog::new(&db_path).expect("catalog");
 

@@ -1,24 +1,29 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-BINARY_NAME="gstackqlite_hypervisor"
+BINARY_NAME="gstackqlite-hypervisor"
 DEFAULT_INSTALL_DIR="${HOME}/.local/bin"
-INSTALL_DIR="${GSTACK_HYPERVISOR_INSTALL_DIR:-${DEFAULT_INSTALL_DIR}}"
-VERSION="${GSTACK_HYPERVISOR_VERSION:-latest}"
-REPOSITORY="${GSTACK_HYPERVISOR_REPO:-}"
+INSTALL_DIR="${GSTACKQLITE_HYPERVISOR_INSTALL_DIR:-${GSTACK_HYPERVISOR_INSTALL_DIR:-${DEFAULT_INSTALL_DIR}}}"
+VERSION="${GSTACKQLITE_HYPERVISOR_VERSION:-${GSTACK_HYPERVISOR_VERSION:-latest}}"
+REPOSITORY="${GSTACKQLITE_HYPERVISOR_REPO:-${GSTACK_HYPERVISOR_REPO:-}}"
 UPDATE_PATH=1
 
 usage() {
   cat <<'EOF'
-Install gstackqlite_hypervisor from a GitHub release.
+Install gstackqlite-hypervisor from a GitHub release.
 
 Usage:
   install.sh [--repo owner/repo] [--version v0.1.0|latest] [--install-dir /path] [--no-path-update]
 
 Environment:
-  GSTACK_HYPERVISOR_REPO         GitHub repository slug, for example "owner/gstackqlite_hypervisor"
-  GSTACK_HYPERVISOR_VERSION      Release tag to install, defaults to "latest"
-  GSTACK_HYPERVISOR_INSTALL_DIR  Install directory, defaults to "$HOME/.local/bin"
+  GSTACKQLITE_HYPERVISOR_REPO         GitHub repository slug, for example "owner/gstackqlite_hypervisor"
+  GSTACKQLITE_HYPERVISOR_VERSION      Release tag to install, defaults to "latest"
+  GSTACKQLITE_HYPERVISOR_INSTALL_DIR  Install directory, defaults to "$HOME/.local/bin"
+
+Compatibility aliases:
+  GSTACK_HYPERVISOR_REPO
+  GSTACK_HYPERVISOR_VERSION
+  GSTACK_HYPERVISOR_INSTALL_DIR
 EOF
 }
 
@@ -53,7 +58,7 @@ while [[ $# -gt 0 ]]; do
 done
 
 if [[ -z "${REPOSITORY}" ]]; then
-  echo "Set GSTACK_HYPERVISOR_REPO or pass --repo owner/repo." >&2
+  echo "Set GSTACKQLITE_HYPERVISOR_REPO or pass --repo owner/repo." >&2
   exit 1
 fi
 

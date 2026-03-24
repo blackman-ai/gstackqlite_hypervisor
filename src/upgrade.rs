@@ -10,8 +10,8 @@ use crate::db::Catalog;
 use crate::ingest::hydrate_commit_by_sha;
 use crate::manifest::{LocalManifestEntry, LocalManifestKind, collect_local_manifest};
 use crate::models::{
-    ApplyResult, CatalogInstall, CommitSnapshotFile, RemoveResult, RevertResult, SyncChangeSet,
-    SyncResult,
+    ApplyResult, CatalogInstall, CommitSnapshotFile, DiffPreviewFile, ProjectDiffPreview,
+    RemoveResult, RevertResult, SyncChangeSet, SyncResult,
 };
 use crate::scan::scan_specific_paths;
 use crate::util::{ensure_dir, timestamp_slug};
@@ -319,6 +319,159 @@ fn merge_text_conflict(local: &[u8], target: &[u8], target_label: &str) -> Optio
     )
 }
 
+fn preview_text(bytes: &[u8]) -> Option<String> {
+    String::from_utf8(bytes.to_vec()).ok()
+}
+
+fn compress_diff_ops(ops: Vec<(char, String)>) -> Vec<String> {
+    let mut output = Vec::new();
+    let mut index = 0usize;
+    while index < ops.len() {
+        let prefix = ops[index].0;
+        let mut end = index + 1;
+        while end < ops.len() && ops[end].0 == prefix {
+            end += 1;
+        }
+        let run = &ops[index..end];
+        if prefix == ' ' && run.len() > 2 {
+            output.push(format!("  {}", run[0].1));
+            output.push(format!("  ... {} unchanged line(s) ...", run.len() - 2));
+            output.push(format!("  {}", run[run.len() - 1].1));
+        } else {
+            for (_, line) in run {
+                output.push(format!("{prefix} {line}"));
+            }
+        }
+        index = end;
+    }
+    output
+}
+
+fn text_diff_preview(old_text: &str, new_text: &str, max_lines: usize) -> (Vec<String>, bool) {
+    let old_lines = old_text.lines().map(ToOwned::to_owned).collect::<Vec<_>>();
+    let new_lines = new_text.lines().map(ToOwned::to_owned).collect::<Vec<_>>();
+
+    if old_lines.len().saturating_mul(new_lines.len()) > 40_000 {
+        let mut lines = vec![
+            format!("- {}", old_lines.first().cloned().unwrap_or_default()),
+            format!("+ {}", new_lines.first().cloned().unwrap_or_default()),
+        ];
+        let truncated = lines.len() > max_lines;
+        lines.truncate(max_lines);
+        return (lines, truncated);
+    }
+
+    let old_len = old_lines.len();
+    let new_len = new_lines.len();
+    let mut lcs = vec![vec![0usize; new_len + 1]; old_len + 1];
+    for old_index in (0..old_len).rev() {
+        for new_index in (0..new_len).rev() {
+            lcs[old_index][new_index] = if old_lines[old_index] == new_lines[new_index] {
+                lcs[old_index + 1][new_index + 1] + 1
+            } else {
+                lcs[old_index + 1][new_index].max(lcs[old_index][new_index + 1])
+            };
+        }
+    }
+
+    let mut old_index = 0usize;
+    let mut new_index = 0usize;
+    let mut ops = Vec::new();
+    while old_index < old_len && new_index < new_len {
+        if old_lines[old_index] == new_lines[new_index] {
+            ops.push((' ', old_lines[old_index].clone()));
+            old_index += 1;
+            new_index += 1;
+        } else if lcs[old_index + 1][new_index] >= lcs[old_index][new_index + 1] {
+            ops.push(('-', old_lines[old_index].clone()));
+            old_index += 1;
+        } else {
+            ops.push(('+', new_lines[new_index].clone()));
+            new_index += 1;
+        }
+    }
+    while old_index < old_len {
+        ops.push(('-', old_lines[old_index].clone()));
+        old_index += 1;
+    }
+    while new_index < new_len {
+        ops.push(('+', new_lines[new_index].clone()));
+        new_index += 1;
+    }
+
+    let mut preview = compress_diff_ops(ops);
+    let truncated = preview.len() > max_lines;
+    preview.truncate(max_lines);
+    (preview, truncated)
+}
+
+fn build_diff_preview_file(
+    path: &str,
+    change_type: &str,
+    old_label: &str,
+    new_label: &str,
+    old_bytes: Option<&[u8]>,
+    new_bytes: Option<&[u8]>,
+    max_lines: usize,
+) -> DiffPreviewFile {
+    let mut preview_lines = vec![format!("--- {old_label}"), format!("+++ {new_label}")];
+
+    let (mut body, truncated) = match (old_bytes, new_bytes) {
+        (Some(old_bytes), Some(new_bytes)) => {
+            match (preview_text(old_bytes), preview_text(new_bytes)) {
+                (Some(old_text), Some(new_text)) => {
+                    text_diff_preview(&old_text, &new_text, max_lines.saturating_sub(2))
+                }
+                _ => (
+                    vec!["(binary or symlink content omitted)".to_string()],
+                    false,
+                ),
+            }
+        }
+        (None, Some(new_bytes)) => match preview_text(new_bytes) {
+            Some(new_text) => {
+                let mut lines = new_text
+                    .lines()
+                    .map(|line| format!("+ {line}"))
+                    .collect::<Vec<_>>();
+                let truncated = lines.len() > max_lines.saturating_sub(2);
+                lines.truncate(max_lines.saturating_sub(2));
+                (lines, truncated)
+            }
+            None => (
+                vec!["(binary or symlink content omitted)".to_string()],
+                false,
+            ),
+        },
+        (Some(old_bytes), None) => match preview_text(old_bytes) {
+            Some(old_text) => {
+                let mut lines = old_text
+                    .lines()
+                    .map(|line| format!("- {line}"))
+                    .collect::<Vec<_>>();
+                let truncated = lines.len() > max_lines.saturating_sub(2);
+                lines.truncate(max_lines.saturating_sub(2));
+                (lines, truncated)
+            }
+            None => (
+                vec!["(binary or symlink content omitted)".to_string()],
+                false,
+            ),
+        },
+        (None, None) => (vec!["(no content available)".to_string()], false),
+    };
+    preview_lines.append(&mut body);
+
+    DiffPreviewFile {
+        path: path.to_string(),
+        change_type: change_type.to_string(),
+        old_label: old_label.to_string(),
+        new_label: new_label.to_string(),
+        preview_lines,
+        truncated,
+    }
+}
+
 fn resolve_projects(
     catalog: &Catalog,
     project_identifiers: &[String],
@@ -448,6 +601,122 @@ fn fallback_commit_ref(catalog: &Catalog) -> Result<(String, Option<String>)> {
     catalog
         .resolve_commit_ref(None, None)?
         .ok_or_else(|| anyhow!("no upstream commit is available in the catalog"))
+}
+
+pub fn project_diff_preview(
+    catalog: &Catalog,
+    project_identifier: &str,
+    version: Option<&str>,
+    commit_sha: Option<&str>,
+    max_files: usize,
+    max_lines: usize,
+) -> Result<ProjectDiffPreview> {
+    let Some((target_commit_sha, target_version)) =
+        catalog.resolve_commit_ref(commit_sha, version)?
+    else {
+        bail!("no upstream commit is available in the catalog");
+    };
+
+    let target_files = ensure_commit_files_available(catalog, &target_commit_sha)?;
+    let target_map = target_files
+        .iter()
+        .map(|file| (file.path.clone(), file.clone()))
+        .collect::<HashMap<_, _>>();
+
+    let projects = resolve_projects(catalog, &[project_identifier.to_string()])?;
+    let Some(project) = projects.into_iter().next() else {
+        bail!("project not found: {project_identifier}");
+    };
+    let install_by_id = build_install_map(catalog)?;
+    let (_current_install, install_path, _) =
+        resolve_project_install(catalog, &project, &install_by_id)?;
+    let local_entries = collect_local_manifest(&install_path)?;
+    let local_map = local_entries
+        .iter()
+        .map(|entry| (entry.path.clone(), entry.clone()))
+        .collect::<HashMap<_, _>>();
+
+    let mut all_paths = BTreeSet::new();
+    for path in target_map.keys() {
+        all_paths.insert(path.clone());
+    }
+    for path in local_map.keys() {
+        all_paths.insert(path.clone());
+    }
+
+    let mut files = Vec::new();
+    let mut added_count = 0usize;
+    let mut updated_count = 0usize;
+    let mut removed_count = 0usize;
+    let target_label = target_version
+        .clone()
+        .unwrap_or_else(|| target_commit_sha.chars().take(12).collect::<String>());
+
+    for path in all_paths {
+        let local = local_map.get(&path);
+        let target = target_map.get(&path);
+        match (local, target) {
+            (None, Some(target)) => {
+                added_count += 1;
+                if files.len() < max_files {
+                    files.push(build_diff_preview_file(
+                        &path,
+                        "added",
+                        "/dev/null",
+                        &format!("gstack {target_label}"),
+                        None,
+                        target.content.as_deref(),
+                        max_lines,
+                    ));
+                }
+            }
+            (Some(local), None) => {
+                removed_count += 1;
+                if files.len() < max_files {
+                    let local_bytes = read_local_entry_content(&install_path, local)?;
+                    files.push(build_diff_preview_file(
+                        &path,
+                        "removed",
+                        "local",
+                        "/dev/null",
+                        Some(local_bytes.as_slice()),
+                        None,
+                        max_lines,
+                    ));
+                }
+            }
+            (Some(local), Some(target))
+                if local.blob_sha != target.blob_sha || local.mode != target.mode =>
+            {
+                updated_count += 1;
+                if files.len() < max_files {
+                    let local_bytes = read_local_entry_content(&install_path, local)?;
+                    files.push(build_diff_preview_file(
+                        &path,
+                        "updated",
+                        "local",
+                        &format!("gstack {target_label}"),
+                        Some(local_bytes.as_slice()),
+                        target.content.as_deref(),
+                        max_lines,
+                    ));
+                }
+            }
+            _ => {}
+        }
+    }
+
+    Ok(ProjectDiffPreview {
+        project,
+        install_path: install_path.to_string_lossy().to_string(),
+        commit_sha: target_commit_sha,
+        version: target_version,
+        total_changed_files: added_count + updated_count + removed_count,
+        added_count,
+        updated_count,
+        removed_count,
+        files,
+    })
 }
 
 pub fn apply_version_to_projects(
@@ -815,8 +1084,12 @@ pub fn remove_projects(
 pub fn revert_projects(
     catalog: &Catalog,
     project_identifiers: &[String],
+    event_id: Option<i64>,
     dry_run: bool,
 ) -> Result<Vec<RevertResult>> {
+    if event_id.is_some() && project_identifiers.len() > 1 {
+        bail!("specific backup event reverts only support one project at a time");
+    }
     let projects = resolve_projects(catalog, project_identifiers)?;
     let install_by_id = build_install_map(catalog)?;
     let mut results = Vec::new();
@@ -856,7 +1129,7 @@ pub fn revert_projects(
         let Some(source_event) = detail
             .sync_events
             .iter()
-            .find(|event| event.backup_path.is_some())
+            .find(|event| event.backup_path.is_some() && event_id.is_none_or(|id| event.id == id))
             .cloned()
         else {
             results.push(RevertResult {
@@ -867,7 +1140,11 @@ pub fn revert_projects(
                 restored_files: Vec::new(),
                 removed_files: Vec::new(),
                 backup_path: None,
-                status: "no_backup".to_string(),
+                status: if event_id.is_some() {
+                    "event_not_found".to_string()
+                } else {
+                    "no_backup".to_string()
+                },
             });
             continue;
         };

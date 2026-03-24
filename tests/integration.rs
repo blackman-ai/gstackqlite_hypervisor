@@ -9,7 +9,9 @@ use gstackqlite_hypervisor::db::Catalog;
 use gstackqlite_hypervisor::ideas::build_ideas;
 use gstackqlite_hypervisor::ingest::ingest_upstream;
 use gstackqlite_hypervisor::scan::scan_local_installs;
-use gstackqlite_hypervisor::upgrade::{apply_version_to_projects, materialize_targets};
+use gstackqlite_hypervisor::upgrade::{
+    apply_version_to_projects, materialize_targets, project_diff_preview, revert_projects,
+};
 
 fn temp_dir(prefix: &str) -> PathBuf {
     let millis = SystemTime::now()
@@ -58,7 +60,7 @@ fn init_fixture_repo(repo_dir: &Path) -> Result<(String, String)> {
 
 #[test]
 fn ingest_scan_and_upgrade_work_end_to_end() -> Result<()> {
-    let workspace = temp_dir("gstack-hypervisor-test");
+    let workspace = temp_dir("gstackqlite-hypervisor-test");
     let upstream_repo = workspace.join("upstream");
     let project_repo = workspace.join("project");
     let install_dir = project_repo.join(".claude").join("skills").join("gstack");
@@ -122,7 +124,7 @@ fn ingest_scan_and_upgrade_work_end_to_end() -> Result<()> {
 
 #[test]
 fn project_catalog_and_merge_aware_apply_work_end_to_end() -> Result<()> {
-    let workspace = temp_dir("gstack-hypervisor-project-test");
+    let workspace = temp_dir("gstackqlite-hypervisor-project-test");
     let upstream_repo = workspace.join("upstream");
     let project_repo = workspace.join("project");
     let install_dir = project_repo.join(".claude").join("skills").join("gstack");
@@ -259,8 +261,97 @@ fn project_catalog_and_merge_aware_apply_work_end_to_end() -> Result<()> {
 }
 
 #[test]
+fn diff_preview_and_targeted_revert_work_end_to_end() -> Result<()> {
+    let workspace = temp_dir("gstackqlite-hypervisor-revert-test");
+    let upstream_repo = workspace.join("upstream");
+    let project_repo = workspace.join("project");
+    let install_dir = project_repo.join(".claude").join("skills").join("gstack");
+    let db_path = workspace.join("catalog.sqlite");
+
+    init_fixture_repo(&upstream_repo)?;
+    let catalog = Catalog::new(&db_path)?;
+    ingest_upstream(
+        &catalog,
+        Some(upstream_repo.to_str().unwrap()),
+        Some("HEAD"),
+    )?;
+
+    fs::create_dir_all(&project_repo)?;
+    run(&project_repo, &["init"])?;
+    run(&project_repo, &["config", "user.name", "Test User"])?;
+    run(&project_repo, &["config", "user.email", "test@example.com"])?;
+    fs::write(project_repo.join("CLAUDE.md"), "Use local skills.\n")?;
+    fs::create_dir_all(project_repo.join(".claude"))?;
+    fs::create_dir_all(install_dir.join("docs"))?;
+    fs::write(install_dir.join("VERSION"), "0.0.1.0\n")?;
+    fs::write(install_dir.join("README.md"), "# locally customized v1\n")?;
+    fs::write(install_dir.join("docs").join("note.md"), "first\n")?;
+    fs::write(install_dir.join("CUSTOM.md"), "keep me\n")?;
+
+    let scan = scan_local_installs(&catalog, std::slice::from_ref(&project_repo), Some(4))?;
+    catalog.record_scan(&scan)?;
+    let mut projects = catalog.list_projects()?;
+    let project = projects.remove(0);
+
+    let preview = project_diff_preview(
+        &catalog,
+        &project.id.to_string(),
+        Some("0.0.2.0"),
+        None,
+        8,
+        12,
+    )?;
+    assert_eq!(preview.version.as_deref(), Some("0.0.2.0"));
+    assert!(preview.total_changed_files >= 3);
+    assert!(preview.files.iter().any(|file| file.path == "README.md"));
+    assert!(preview.files.iter().any(|file| {
+        file.path == "README.md"
+            && file.preview_lines.iter().any(|line| {
+                line.contains("# locally customized v1") || line.contains("# fixture v2")
+            })
+    }));
+
+    let project_identifier = vec![project.id.to_string()];
+    let applied =
+        apply_version_to_projects(&catalog, Some("0.0.2.0"), None, &project_identifier, false)?;
+    assert_eq!(applied.len(), 1);
+
+    let history = catalog.project_backup_history(&project.id.to_string(), 10)?;
+    assert_eq!(history.len(), 1);
+    let event_id = history[0].id;
+
+    let dry_run = revert_projects(&catalog, &project_identifier, Some(event_id), true)?;
+    assert_eq!(dry_run.len(), 1);
+    assert_eq!(dry_run[0].status, "dry_run");
+    assert!(
+        dry_run[0]
+            .restored_files
+            .iter()
+            .any(|path| path == "README.md")
+    );
+
+    let reverted = revert_projects(&catalog, &project_identifier, Some(event_id), false)?;
+    assert_eq!(reverted.len(), 1);
+    assert_eq!(reverted[0].status, "reverted");
+    assert_eq!(
+        fs::read_to_string(install_dir.join("VERSION"))?.trim(),
+        "0.0.1.0"
+    );
+    assert_eq!(
+        fs::read_to_string(install_dir.join("README.md"))?.trim(),
+        "# locally customized v1"
+    );
+    assert_eq!(
+        fs::read_to_string(install_dir.join("CUSTOM.md"))?.trim(),
+        "keep me"
+    );
+
+    Ok(())
+}
+
+#[test]
 fn codex_project_markers_are_detected() -> Result<()> {
-    let workspace = temp_dir("gstack-hypervisor-codex-project-test");
+    let workspace = temp_dir("gstackqlite-hypervisor-codex-project-test");
     let upstream_repo = workspace.join("upstream");
     let project_repo = workspace.join("codex-project");
     let install_dir = project_repo.join(".codex").join("skills").join("gstack");
@@ -326,7 +417,7 @@ fn codex_project_markers_are_detected() -> Result<()> {
 
 #[test]
 fn plain_git_repos_are_cataloged_and_ready_for_install() -> Result<()> {
-    let workspace = temp_dir("gstack-hypervisor-git-project-test");
+    let workspace = temp_dir("gstackqlite-hypervisor-git-project-test");
     let upstream_repo = workspace.join("upstream");
     let project_repo = workspace.join("git-only-project");
     let db_path = workspace.join("catalog.sqlite");

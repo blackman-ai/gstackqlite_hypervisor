@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::io::{self, Stdout};
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
@@ -19,11 +20,11 @@ use crate::config::{DEFAULT_MAX_DEPTH, default_scan_roots};
 use crate::db::Catalog;
 use crate::lofi::{LofiPlayer, TrackKind};
 use crate::models::{
-    CatalogCommitNote, CatalogInstall, CatalogProject, CatalogSummary, CatalogVersion,
-    CatalogVersionContext,
+    CatalogCommitNote, CatalogInstall, CatalogProject, CatalogSummary, CatalogSyncEvent,
+    CatalogVersion, CatalogVersionContext, DiffPreviewFile, ProjectDiffPreview,
 };
 use crate::scan::sync_catalog;
-use crate::upgrade::apply_version_to_projects;
+use crate::upgrade::{apply_version_to_projects, project_diff_preview, revert_projects};
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Focus {
@@ -94,6 +95,7 @@ const THEMES: [Theme; 4] = [
 const UI_THEME_SETTING_KEY: &str = "tui.theme_id";
 const UI_TRACK_SETTING_KEY: &str = "tui.track_key";
 const UI_MUSIC_SETTING_KEY: &str = "tui.music_enabled";
+const DIFF_PREVIEW_DEBOUNCE: Duration = Duration::from_millis(150);
 
 fn theme_index_by_id(theme_id: &str) -> Option<usize> {
     THEMES.iter().position(|theme| theme.id == theme_id)
@@ -123,8 +125,17 @@ struct App {
     all_versions: Vec<CatalogVersion>,
     versions: Vec<CatalogVersion>,
     version_context: Option<CatalogVersionContext>,
+    diff_preview: Option<ProjectDiffPreview>,
+    backup_history: Vec<CatalogSyncEvent>,
+    version_context_cache: HashMap<(String, String), CatalogVersionContext>,
+    diff_preview_cache: HashMap<(i64, String), ProjectDiffPreview>,
+    backup_history_cache: HashMap<i64, Vec<CatalogSyncEvent>>,
     selected_project: usize,
     selected_version: usize,
+    selected_diff_file: usize,
+    selected_backup: usize,
+    diff_preview_pending: bool,
+    diff_preview_requested_at: Option<Instant>,
     focus: Focus,
     input_mode: InputMode,
     project_filter: String,
@@ -152,8 +163,17 @@ impl App {
             all_versions: Vec::new(),
             versions: Vec::new(),
             version_context: None,
+            diff_preview: None,
+            backup_history: Vec::new(),
+            version_context_cache: HashMap::new(),
+            diff_preview_cache: HashMap::new(),
+            backup_history_cache: HashMap::new(),
             selected_project: 0,
             selected_version: 0,
+            selected_diff_file: 0,
+            selected_backup: 0,
+            diff_preview_pending: false,
+            diff_preview_requested_at: None,
             focus: Focus::Projects,
             input_mode: InputMode::Normal,
             project_filter: String::new(),
@@ -268,7 +288,11 @@ impl App {
         self.installs = self.catalog.list_installs(false, None, None)?;
         self.all_projects = self.catalog.list_projects()?;
         self.all_versions = self.catalog.list_versions(None).unwrap_or_default();
-        self.apply_filters()
+        self.version_context_cache.clear();
+        self.diff_preview_cache.clear();
+        self.backup_history_cache.clear();
+        self.apply_filters()?;
+        self.refresh_pending_diff_preview(true)
     }
 
     fn apply_filters(&mut self) -> Result<()> {
@@ -289,7 +313,14 @@ impl App {
             selected_version_sha.as_deref(),
             previous_version_index,
         );
-        self.refresh_version_context()
+        self.refresh_selection_views()
+    }
+
+    fn refresh_selection_views(&mut self) -> Result<()> {
+        self.refresh_version_context()?;
+        self.refresh_backup_history()?;
+        self.queue_diff_preview_refresh();
+        Ok(())
     }
 
     fn refresh_version_context(&mut self) -> Result<()> {
@@ -300,11 +331,124 @@ impl App {
             .selected_version()
             .map(|version| version.commit_sha.clone());
         self.version_context = if let Some(selected_commit_sha) = selected_commit_sha {
-            self.catalog
-                .version_context(current_commit_sha.as_deref(), &selected_commit_sha, 12)?
+            let cache_key = (
+                current_commit_sha.clone().unwrap_or_default(),
+                selected_commit_sha.clone(),
+            );
+            if let Some(context) = self.version_context_cache.get(&cache_key) {
+                Some(context.clone())
+            } else {
+                let context = self.catalog.version_context(
+                    current_commit_sha.as_deref(),
+                    &selected_commit_sha,
+                    12,
+                )?;
+                if let Some(context) = context.as_ref() {
+                    self.version_context_cache
+                        .insert(cache_key, context.clone());
+                }
+                context
+            }
         } else {
             None
         };
+        Ok(())
+    }
+
+    fn current_diff_preview_key(&self) -> Option<(i64, String)> {
+        let project = self.selected_project()?;
+        let version = self.selected_version()?;
+        Some((project.id, version.commit_sha.clone()))
+    }
+
+    fn queue_diff_preview_refresh(&mut self) {
+        let current_key = self.current_diff_preview_key();
+        let active_key = self
+            .diff_preview
+            .as_ref()
+            .map(|preview| (preview.project.id, preview.commit_sha.clone()));
+
+        match current_key {
+            Some(key) if active_key.as_ref() == Some(&key) && !self.diff_preview_pending => {}
+            Some(key) => {
+                self.selected_diff_file = 0;
+                if let Some(cached) = self.diff_preview_cache.get(&key) {
+                    self.diff_preview = Some(cached.clone());
+                    self.diff_preview_pending = false;
+                    self.diff_preview_requested_at = None;
+                } else {
+                    self.diff_preview = None;
+                    self.diff_preview_pending = true;
+                    self.diff_preview_requested_at = Some(Instant::now());
+                }
+            }
+            None => {
+                self.diff_preview = None;
+                self.diff_preview_pending = false;
+                self.diff_preview_requested_at = None;
+                self.selected_diff_file = 0;
+            }
+        }
+    }
+
+    fn refresh_pending_diff_preview(&mut self, force: bool) -> Result<()> {
+        if !self.diff_preview_pending {
+            return Ok(());
+        }
+
+        if !force
+            && self
+                .diff_preview_requested_at
+                .map(|started_at| started_at.elapsed() < DIFF_PREVIEW_DEBOUNCE)
+                .unwrap_or(false)
+        {
+            return Ok(());
+        }
+
+        let Some((project_id, commit_sha)) = self.current_diff_preview_key() else {
+            self.diff_preview = None;
+            self.diff_preview_pending = false;
+            self.diff_preview_requested_at = None;
+            return Ok(());
+        };
+
+        let preview = project_diff_preview(
+            &self.catalog,
+            &project_id.to_string(),
+            None,
+            Some(&commit_sha),
+            8,
+            10,
+        )?;
+        self.selected_diff_file = self
+            .selected_diff_file
+            .min(preview.files.len().saturating_sub(1));
+        self.diff_preview_cache
+            .insert((project_id, commit_sha), preview.clone());
+        self.diff_preview = Some(preview);
+        self.diff_preview_pending = false;
+        self.diff_preview_requested_at = None;
+        Ok(())
+    }
+
+    fn refresh_backup_history(&mut self) -> Result<()> {
+        self.backup_history = if let Some(project) = self.selected_project() {
+            if let Some(history) = self.backup_history_cache.get(&project.id) {
+                history.clone()
+            } else {
+                let history = self
+                    .catalog
+                    .project_backup_history(&project.id.to_string(), 20)?;
+                self.backup_history_cache
+                    .insert(project.id, history.clone());
+                history
+            }
+        } else {
+            Vec::new()
+        };
+        self.selected_backup = self
+            .selected_backup
+            .min(self.backup_history.len().saturating_sub(1));
         Ok(())
     }
 
@@ -418,6 +562,40 @@ impl App {
         let _ = self.refresh();
     }
 
+    fn revert_selected(&mut self, dry_run: bool) {
+        let Some(project) = self.selected_project().cloned() else {
+            self.status = "no project selected".to_string();
+            return;
+        };
+        let event_id = self.selected_backup_event().map(|event| event.id);
+        match revert_projects(&self.catalog, &[project.id.to_string()], event_id, dry_run) {
+            Ok(results) => {
+                if let Some(result) = results.first() {
+                    self.status = format!(
+                        "{} restored={} removed={} source={}",
+                        if dry_run {
+                            "revert dry-run"
+                        } else {
+                            "reverted"
+                        },
+                        result.restored_files.len(),
+                        result.removed_files.len(),
+                        result
+                            .restored_from_backup_path
+                            .clone()
+                            .unwrap_or_else(|| "-".to_string())
+                    );
+                } else {
+                    self.status = "no matching revert result".to_string();
+                }
+            }
+            Err(error) => {
+                self.status = format!("revert failed: {error}");
+            }
+        }
+        let _ = self.refresh();
+    }
+
     fn toggle_help(&mut self) {
         self.show_help = !self.show_help;
         self.status = if self.show_help {
@@ -494,6 +672,16 @@ impl App {
             .find(|install| install.id == install_id)
     }
 
+    fn selected_diff_file(&self) -> Option<&DiffPreviewFile> {
+        self.diff_preview
+            .as_ref()
+            .and_then(|preview| preview.files.get(self.selected_diff_file))
+    }
+
+    fn selected_backup_event(&self) -> Option<&CatalogSyncEvent> {
+        self.backup_history.get(self.selected_backup)
+    }
+
     fn next(&mut self) {
         match self.focus {
             Focus::Projects => {
@@ -507,7 +695,7 @@ impl App {
                 }
             }
         }
-        let _ = self.refresh_version_context();
+        let _ = self.refresh_selection_views();
     }
 
     fn previous(&mut self) {
@@ -531,7 +719,76 @@ impl App {
                 }
             }
         }
-        let _ = self.refresh_version_context();
+        let _ = self.refresh_selection_views();
+    }
+
+    fn next_diff_file(&mut self) {
+        if self.diff_preview_pending {
+            self.status = "diff preview updating...".to_string();
+            return;
+        }
+        let Some(preview) = self.diff_preview.as_ref() else {
+            self.status = "no changed files to preview".to_string();
+            return;
+        };
+        if preview.files.is_empty() {
+            self.status = "no changed files to preview".to_string();
+            return;
+        }
+        self.selected_diff_file = (self.selected_diff_file + 1) % preview.files.len();
+        if let Some(file) = self.selected_diff_file() {
+            self.status = format!(
+                "diff preview {}/{}: {}",
+                self.selected_diff_file + 1,
+                preview.files.len(),
+                file.path
+            );
+        }
+    }
+
+    fn previous_diff_file(&mut self) {
+        if self.diff_preview_pending {
+            self.status = "diff preview updating...".to_string();
+            return;
+        }
+        let Some(preview) = self.diff_preview.as_ref() else {
+            self.status = "no changed files to preview".to_string();
+            return;
+        };
+        if preview.files.is_empty() {
+            self.status = "no changed files to preview".to_string();
+            return;
+        }
+        self.selected_diff_file = if self.selected_diff_file == 0 {
+            preview.files.len() - 1
+        } else {
+            self.selected_diff_file - 1
+        };
+        if let Some(file) = self.selected_diff_file() {
+            self.status = format!(
+                "diff preview {}/{}: {}",
+                self.selected_diff_file + 1,
+                preview.files.len(),
+                file.path
+            );
+        }
+    }
+
+    fn cycle_backup_event(&mut self) {
+        if self.backup_history.is_empty() {
+            self.status = "no backup history for selected project".to_string();
+            return;
+        }
+        self.selected_backup = (self.selected_backup + 1) % self.backup_history.len();
+        if let Some(event) = self.selected_backup_event() {
+            self.status = format!(
+                "backup {}/{}: event #{} {}",
+                self.selected_backup + 1,
+                self.backup_history.len(),
+                event.id,
+                event.created_at
+            );
+        }
     }
 
     fn toggle_focus(&mut self) {
@@ -923,7 +1180,7 @@ fn render(app: &mut App, terminal: &mut Terminal<CrosstermBackend<Stdout>>) -> R
                 ),
             ),
             Line::from(
-                "Keys: q quit | h help | g sync | / filter | f clear | m music | t track | c theme | tab switch | j/k move | d dry-run | a apply | r refresh",
+                "Keys: q quit | h help | g sync | / filter | f clear | m music | t track | c theme | tab switch | j/k move | ←/→ diff | d dry-run | a apply | b backup | z revert dry-run | x revert | r refresh",
             ),
             Line::from(Span::styled(
                 app.status.clone(),
@@ -1103,6 +1360,7 @@ fn build_help_lines(app: &App, theme: Theme) -> Vec<Line<'static>> {
             "  tab switches focus between Projects and Versions. Current focus: {focus_label}."
         )),
         Line::from("  j / k or arrow keys move the current selection."),
+        Line::from("  left / right cycles the selected file diff preview."),
         Line::from("  h, ?, enter, or esc closes this help modal."),
         Line::from(""),
         Line::from("Filters"),
@@ -1120,6 +1378,9 @@ fn build_help_lines(app: &App, theme: Theme) -> Vec<Line<'static>> {
         Line::from("  g syncs upstream gstack history and rescans local projects."),
         Line::from("  d dry-runs the selected version against the selected project."),
         Line::from("  a applies the selected version with merge-aware updates and backups."),
+        Line::from("  b cycles backup-history entries for the selected project."),
+        Line::from("  z dry-runs a revert from the selected backup entry."),
+        Line::from("  x restores the selected backup entry and creates a new backup first."),
         Line::from("  r refreshes the catalog view from SQLite."),
         Line::from(""),
         Line::from("Audio and Theme"),
@@ -1136,10 +1397,10 @@ fn build_help_lines(app: &App, theme: Theme) -> Vec<Line<'static>> {
             "  Projects lists repos sorted by install state, then name. Row labels are local, global, ready, or configured.",
         ),
         Line::from(
-            "  Versions lists upstream gstack versions from SQLite; the right pane shows commit context and file delta.",
+            "  Versions lists upstream gstack versions from SQLite; the right pane shows commit context and a real file diff preview.",
         ),
         Line::from(
-            "  Project Detail shows the selected project's install state and what the selected target would change.",
+            "  Project Detail shows install state, selected backup history, and the current revert/apply target.",
         ),
     ]
 }
@@ -1246,14 +1507,58 @@ fn build_version_notes(app: &App, theme: Theme) -> Vec<Line<'static>> {
         Style::default().fg(theme.accent),
     )));
 
-    for path in context.diff.updated_paths.iter().take(2) {
-        lines.push(Line::from(format!("~ {path}")));
+    if app.diff_preview_pending {
+        lines.push(Line::from(Span::styled(
+            "Diff preview updating...",
+            Style::default().fg(theme.muted),
+        )));
+        return lines;
     }
-    for path in context.diff.added_paths.iter().take(2) {
-        lines.push(Line::from(format!("+ {path}")));
+
+    let Some(diff_preview) = app.diff_preview.as_ref() else {
+        lines.push(Line::from("Diff preview unavailable."));
+        return lines;
+    };
+    if diff_preview.files.is_empty() {
+        lines.push(Line::from("No file content changes for this target."));
+        return lines;
     }
-    for path in context.diff.removed_paths.iter().take(1) {
-        lines.push(Line::from(format!("- {path}")));
+
+    let Some(file) = app.selected_diff_file() else {
+        lines.push(Line::from("No diff file selected."));
+        return lines;
+    };
+    lines.push(Line::from(""));
+    lines.push(Line::from(Span::styled(
+        format!(
+            "Preview file {}/{} [{}] {}",
+            app.selected_diff_file + 1,
+            diff_preview.files.len(),
+            file.change_type,
+            file.path
+        ),
+        Style::default().fg(theme.accent_soft),
+    )));
+    for preview_line in &file.preview_lines {
+        let fg = if preview_line.starts_with("+ ") || preview_line.starts_with("+++") {
+            theme.accent
+        } else if preview_line.starts_with("- ") || preview_line.starts_with("---") {
+            Color::LightRed
+        } else if preview_line.contains("unchanged line(s)") {
+            theme.muted
+        } else {
+            theme.text
+        };
+        lines.push(Line::from(Span::styled(
+            preview_line.clone(),
+            Style::default().fg(fg),
+        )));
+    }
+    if file.truncated {
+        lines.push(Line::from(Span::styled(
+            "... diff preview truncated ...",
+            Style::default().fg(theme.muted),
+        )));
     }
 
     lines
@@ -1266,8 +1571,7 @@ fn build_project_detail(app: &App, theme: Theme) -> Vec<Line<'static>> {
     let install = app.install_for_selected_project();
     let target = app.selected_version();
     let context = app.version_context.as_ref();
-
-    vec![
+    let mut lines = vec![
         Line::from(format!("Project: {}", project.name)),
         Line::from(format!("Path: {}", project.canonical_path)),
         Line::from(format!(
@@ -1345,35 +1649,79 @@ fn build_project_detail(app: &App, theme: Theme) -> Vec<Line<'static>> {
                     .to_string()
             }
         }),
-        Line::from(match context.map(|ctx| ctx.direction.as_str()) {
-            Some("upgrade") => Span::styled(
-                "Change view: showing commits you would gain plus file-level delta to the selected version",
-                Style::default().fg(theme.accent),
-            ),
-            Some("downgrade") => Span::styled(
-                "Change view: showing commits you would roll back plus file-level delta to the selected version",
-                Style::default().fg(theme.accent),
-            ),
-            Some("current") => Span::styled(
-                "Change view: selected version already matches the project's mapped upstream commit",
-                Style::default().fg(theme.muted),
-            ),
-            Some("preview") => Span::styled(
-                "Change view: this project has no mapped upstream base, so the diff is a new-install preview",
-                Style::default().fg(theme.muted),
-            ),
-            _ => Span::styled(
-                "Change view: the selected commit is outside this project's known first-parent path",
-                Style::default().fg(theme.muted),
-            ),
-        }),
-    ]
+    ];
+
+    lines.push(Line::from(match app.selected_backup_event() {
+        Some(event) => format!(
+            "Backup history: {}/{} selected event #{} {} version={} files={}",
+            app.selected_backup + 1,
+            app.backup_history.len(),
+            event.id,
+            event.created_at,
+            event.version.clone().unwrap_or_else(|| event
+                .commit_sha
+                .chars()
+                .take(12)
+                .collect::<String>()),
+            event.changed_files.len()
+        ),
+        None => "Backup history: no revertable backups cataloged yet".to_string(),
+    }));
+    lines.push(Line::from(match app.selected_backup_event() {
+        Some(event) => format!(
+            "Revert controls: b cycle history | z dry-run revert | x revert from {}",
+            event.backup_path.clone().unwrap_or_else(|| "-".to_string())
+        ),
+        None => "Revert controls: b cycle history once backups exist".to_string(),
+    }));
+    lines.push(Line::from(match app.selected_diff_file() {
+        Some(file) => format!(
+            "Diff controls: left/right preview files ({}/{}) current={}",
+            app.selected_diff_file + 1,
+            app.diff_preview
+                .as_ref()
+                .map(|preview| preview.files.len())
+                .unwrap_or(0),
+            file.path
+        ),
+        None if app.diff_preview_pending => {
+            "Diff controls: preview is updating for the current selection".to_string()
+        }
+        None => "Diff controls: no changed files in the current preview".to_string(),
+    }));
+    lines.push(Line::from(match context.map(|ctx| ctx.direction.as_str()) {
+        Some("upgrade") => Span::styled(
+            "Change view: showing commits you would gain plus file-level delta to the selected version",
+            Style::default().fg(theme.accent),
+        ),
+        Some("downgrade") => Span::styled(
+            "Change view: showing commits you would roll back plus file-level delta to the selected version",
+            Style::default().fg(theme.accent),
+        ),
+        Some("current") => Span::styled(
+            "Change view: selected version already matches the project's mapped upstream commit",
+            Style::default().fg(theme.muted),
+        ),
+        Some("preview") => Span::styled(
+            "Change view: this project has no mapped upstream base, so the diff is a new-install preview",
+            Style::default().fg(theme.muted),
+        ),
+        _ => Span::styled(
+            "Change view: the selected commit is outside this project's known first-parent path",
+            Style::default().fg(theme.muted),
+        ),
+    }));
+
+    lines
 }
 
 fn run_loop(app: &mut App, terminal: &mut Terminal<CrosstermBackend<Stdout>>) -> Result<()> {
     loop {
+        if let Err(error) = app.refresh_pending_diff_preview(false) {
+            app.status = format!("diff preview refresh failed: {error}");
+        }
         render(app, terminal)?;
-        if event::poll(Duration::from_millis(200))? {
+        if event::poll(Duration::from_millis(100))? {
             if let Event::Key(key) = event::read()? {
                 if app.show_help {
                     match key.code {
@@ -1397,12 +1745,17 @@ fn run_loop(app: &mut App, terminal: &mut Terminal<CrosstermBackend<Stdout>>) ->
                         KeyCode::Char('c') => app.cycle_theme(),
                         KeyCode::Char('a') => app.apply_selected(false),
                         KeyCode::Char('d') => app.apply_selected(true),
+                        KeyCode::Char('b') => app.cycle_backup_event(),
+                        KeyCode::Char('z') => app.revert_selected(true),
+                        KeyCode::Char('x') => app.revert_selected(false),
                         KeyCode::Char('r') => {
                             if let Err(error) = app.refresh() {
                                 app.status = format!("refresh failed: {error}");
                             }
                         }
                         KeyCode::Tab => app.toggle_focus(),
+                        KeyCode::Right => app.next_diff_file(),
+                        KeyCode::Left => app.previous_diff_file(),
                         KeyCode::Down | KeyCode::Char('j') => app.next(),
                         KeyCode::Up | KeyCode::Char('k') => app.previous(),
                         _ => {}

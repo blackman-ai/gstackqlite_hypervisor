@@ -310,6 +310,29 @@ pub struct CatalogVersionContext {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DiffPreviewFile {
+    pub path: String,
+    pub change_type: String,
+    pub old_label: String,
+    pub new_label: String,
+    pub preview_lines: Vec<String>,
+    pub truncated: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProjectDiffPreview {
+    pub project: CatalogProject,
+    pub install_path: String,
+    pub commit_sha: String,
+    pub version: Option<String>,
+    pub total_changed_files: usize,
+    pub added_count: usize,
+    pub updated_count: usize,
+    pub removed_count: usize,
+    pub files: Vec<DiffPreviewFile>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Idea {
     pub severity: String,
     pub title: String,

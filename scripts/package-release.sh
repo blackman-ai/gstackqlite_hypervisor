@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-BINARY_NAME="${BINARY_NAME:-gstackqlite_hypervisor}"
+BINARY_NAME="${BINARY_NAME:-gstackqlite-hypervisor}"
 TARGET="${TARGET:?TARGET environment variable is required}"
 RAW_VERSION="${VERSION:?VERSION environment variable is required}"
 VERSION="${RAW_VERSION#v}"

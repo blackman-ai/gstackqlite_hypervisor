@@ -21,7 +21,7 @@ pub fn ingest_upstream(
     let source = catalog.source_state()?;
     let repo_url = repo_url.unwrap_or(source.repo_url.as_str()).to_string();
     let reference = reference.unwrap_or(source.default_ref.as_str()).to_string();
-    let temp = TempWorkdir::new("gstack-hypervisor")?;
+    let temp = TempWorkdir::new("gstackqlite-hypervisor")?;
 
     let result = (|| -> Result<IngestSummary> {
         git::clone_repo(&repo_url, temp.path())?;
@@ -116,7 +116,7 @@ pub fn hydrate_commit_contents(
 
 pub fn hydrate_commit_by_sha(catalog: &Catalog, commit_sha: &str) -> Result<usize> {
     let source = catalog.source_state()?;
-    let temp = TempWorkdir::new("gstack-hypervisor-hydrate")?;
+    let temp = TempWorkdir::new("gstackqlite-hypervisor-hydrate")?;
     git::clone_repo(&source.repo_url, temp.path())?;
     hydrate_commit_contents(catalog, temp.path(), commit_sha)
 }

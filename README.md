@@ -1,6 +1,6 @@
 # gstackqlite_hypervisor
 
-`gstackqlite_hypervisor` is a Rust, SQLite-first local supervisor for [gstack](https://github.com/garrytan/gstack), with a terminal UI as the primary interface.
+`gstackqlite_hypervisor` is a Rust, SQLite-first local supervisor for [gstack](https://github.com/garrytan/gstack), with a terminal UI and an installable CLI binary named `gstackqlite-hypervisor`.
 
 It treats Git as an ingestion transport only:
 
@@ -35,6 +35,9 @@ It treats Git as an ingestion transport only:
   - repo-local `.agents/skills/gstack`
 - startup sync on TUI launch
 - project-centric version browser and apply flow
+- targeted revert flow from backup history
+- pre-apply diff previews in both the TUI and CLI
+- Rust stdio MCP server mode for external agents
 - merge-aware apply with backup retention for local customizations
 - optional generated lo-fi loop for the TUI, with startup-hub themed tracks and terminal palettes
 - persisted TUI preferences for selected theme, track, and music on/off state
@@ -43,6 +46,18 @@ It treats Git as an ingestion transport only:
 
 ```bash
 cargo build
+```
+
+Run the local dev binary:
+
+```bash
+cargo run
+```
+
+Install the CLI from the local checkout:
+
+```bash
+cargo install --path . --bin gstackqlite-hypervisor
 ```
 
 ## Distribution
@@ -56,8 +71,8 @@ For a public GitHub repo, the intended release flow is:
 Unix install command:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/YOUR_ORG/YOUR_REPO/main/scripts/install.sh | \
-  GSTACK_HYPERVISOR_REPO=YOUR_ORG/YOUR_REPO bash
+curl -fsSL https://raw.githubusercontent.com/blackman-ai/gstackqlite_hypervisor/main/scripts/install.sh | \
+  GSTACKQLITE_HYPERVISOR_REPO=blackman-ai/gstackqlite_hypervisor bash
 ```
 
 The installer:
@@ -75,79 +90,143 @@ Release assets are built by [release.yml](/Users/michaelpoage/Work/gstackqlite_h
 Open the TUI:
 
 ```bash
-cargo run
+gstackqlite-hypervisor
 ```
 
 Sync upstream history plus local project/install state:
 
 ```bash
-cargo run -- sync --root ~/Work --root ~/src
+gstackqlite-hypervisor sync --root ~/Work --root ~/src
 ```
 
 List discovered git/Claude/Codex projects:
 
 ```bash
-cargo run -- projects
+gstackqlite-hypervisor projects
 ```
 
 Inspect one project:
 
 ```bash
-cargo run -- project 12
+gstackqlite-hypervisor project 12
+```
+
+List revertable backup events for one project:
+
+```bash
+gstackqlite-hypervisor history 12
 ```
 
 Search historical upstream versions:
 
 ```bash
-cargo run -- versions --search 0.11
+gstackqlite-hypervisor versions --search 0.11
+```
+
+Preview the diff between one project and a target version:
+
+```bash
+gstackqlite-hypervisor diff 12 --version 0.11.10.0
 ```
 
 Dry-run a version apply against one project:
 
 ```bash
-cargo run -- apply --project 12 --version 0.11.10.0 --dry-run
+gstackqlite-hypervisor apply --project 12 --version 0.11.10.0 --dry-run
 ```
 
 Apply a specific version to one or more projects:
 
 ```bash
-cargo run -- apply --project 12 --project ~/Work/my-app --version 0.11.10.0
+gstackqlite-hypervisor apply --project 12 --project ~/Work/my-app --version 0.11.10.0
+```
+
+Dry-run a revert from the latest or selected backup event:
+
+```bash
+gstackqlite-hypervisor revert --project 12 --dry-run
+gstackqlite-hypervisor revert --project 12 --event 44 --dry-run
+```
+
+Apply a targeted revert from backup history:
+
+```bash
+gstackqlite-hypervisor revert --project 12 --event 44
 ```
 
 Raw upstream ingest:
 
 ```bash
-cargo run -- ingest
+gstackqlite-hypervisor ingest
 ```
 
 Raw local scan:
 
 ```bash
-cargo run -- scan --root ~/Work --root ~/src
+gstackqlite-hypervisor scan --root ~/Work --root ~/src
 ```
 
 List catalog installs:
 
 ```bash
-cargo run -- list
+gstackqlite-hypervisor list
 ```
 
 Generate ideas:
 
 ```bash
-cargo run -- ideas
+gstackqlite-hypervisor ideas
 ```
 
 Dry-run outdated upgrades:
 
 ```bash
-cargo run -- upgrade --outdated --dry-run
+gstackqlite-hypervisor upgrade --outdated --dry-run
 ```
 
 Apply outdated upgrades:
 
 ```bash
-cargo run -- upgrade --outdated
+gstackqlite-hypervisor upgrade --outdated
+```
+
+Run the MCP server over stdio:
+
+```bash
+gstackqlite-hypervisor mcp
+```
+
+Install the MCP server globally for both Claude and Codex:
+
+```bash
+gstackqlite-hypervisor mcp install --global
+```
+
+Install it for just one agent:
+
+```bash
+gstackqlite-hypervisor mcp install --agent claude
+gstackqlite-hypervisor mcp install --agent codex
+```
+
+Install it into one project instead of your global agent config:
+
+```bash
+gstackqlite-hypervisor mcp install --project ~/Work/my-app
+```
+
+Inspect current MCP wiring:
+
+```bash
+gstackqlite-hypervisor mcp status --global
+gstackqlite-hypervisor mcp status --project ~/Work/my-app
+```
+
+Remove the MCP wiring globally or for one project:
+
+```bash
+gstackqlite-hypervisor mcp uninstall --global
+gstackqlite-hypervisor mcp uninstall --project ~/Work/my-app
 ```
 
 ## TUI keys
@@ -159,8 +238,12 @@ cargo run -- upgrade --outdated
 - `/`: start filtering the focused list
 - `f`: clear the focused list filter
 - `j` / `k`: move selection
+- `left` / `right`: cycle file diff previews for the selected version
 - `d`: dry-run apply of the selected version to the selected project
 - `a`: apply the selected version to the selected project
+- `b`: cycle backup-history entries for the selected project
+- `z`: dry-run revert from the selected backup-history entry
+- `x`: revert from the selected backup-history entry
 - `m`: toggle the generated lo-fi loop
 - `t`: cycle tracks (`Palo Alto Dawn`, `SoMa Afterhours`, `Shibuya Rain`, `Shenzhen Circuit`, `Seoul Rooftops`, `Flatiron Bebop`)
 - `c`: cycle terminal themes (`Sand Hill Sandstone`, `Singapore Harbor`, `Bengaluru Garden`, `Shoreditch Neon`)
@@ -171,10 +254,21 @@ cargo run -- upgrade --outdated
 - SQLite database: `~/.gstack/hypervisor/catalog.sqlite`
 - Backups: `~/.gstack/hypervisor/backups/`
 
-Override the database path with `--db /path/to/catalog.sqlite` or `GSTACK_HYPERVISOR_DB=/path/to/catalog.sqlite`.
+Override the database path with `--db /path/to/catalog.sqlite` or `GSTACKQLITE_HYPERVISOR_DB=/path/to/catalog.sqlite`.
 
-## Next steps
+## MCP Tools
 
-- richer revert flows from backup history
-- diff views inside the TUI before apply
-- MCP server in Rust
+The stdio MCP server exposes tool-style access to the same local catalog and actions:
+
+- `sync_catalog`
+- `list_projects`
+- `project_detail`
+- `project_history`
+- `list_versions`
+- `diff_preview`
+- `apply_version`
+- `revert_project`
+
+`gstackqlite-hypervisor mcp install` edits Claude and Codex config files directly so users can turn the server on or off globally or per project without hand-editing JSON or TOML.
+
+Use `gstackqlite-hypervisor mcp serve` when wiring it into another MCP client manually.

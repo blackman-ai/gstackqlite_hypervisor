@@ -9,7 +9,7 @@ permissions:
   contents: write
 
 env:
-  BINARY_NAME: gstackqlite_hypervisor
+  BINARY_NAME: gstackqlite-hypervisor
 
 jobs:
   build:

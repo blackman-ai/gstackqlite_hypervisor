@@ -78,7 +78,8 @@ pub fn timestamp_slug() -> String {
 }
 
 pub fn default_db_path() -> PathBuf {
-    std::env::var_os("GSTACK_HYPERVISOR_DB")
+    std::env::var_os("GSTACKQLITE_HYPERVISOR_DB")
+        .or_else(|| std::env::var_os("GSTACK_HYPERVISOR_DB"))
         .map(PathBuf::from)
         .unwrap_or_else(config::default_database_path)
 }

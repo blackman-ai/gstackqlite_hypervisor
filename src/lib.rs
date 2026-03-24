@@ -5,6 +5,7 @@ pub mod ideas;
 pub mod ingest;
 pub mod lofi;
 pub mod manifest;
+pub mod mcp;
 pub mod models;
 pub mod scan;
 pub mod tui;
