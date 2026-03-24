@@ -34,12 +34,38 @@ It treats Git as an ingestion transport only:
 - project-centric version browser and apply flow
 - merge-aware apply with backup retention for local customizations
 - optional generated lo-fi loop for the TUI, with startup-hub themed tracks and terminal palettes
+- persisted TUI preferences for selected theme, track, and music on/off state
 
 ## Build
 
 ```bash
 cargo build
 ```
+
+## Distribution
+
+For a public GitHub repo, the intended release flow is:
+
+- push normal branches and PRs to run CI
+- push a tag like `v0.1.0` to build release archives and publish a GitHub release
+- let users install from the release page or via the installer script
+
+Unix install command:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/YOUR_ORG/YOUR_REPO/main/scripts/install.sh | \
+  GSTACK_HYPERVISOR_REPO=YOUR_ORG/YOUR_REPO bash
+```
+
+The installer:
+
+- detects macOS or Linux target architecture
+- downloads the matching release archive plus `SHA256SUMS`
+- verifies the archive checksum before unpacking
+- installs the binary to `~/.local/bin` by default
+- updates `zsh`, `bash`, `fish`, or fallback profile config if that directory is not already on `PATH`
+
+Release assets are built by [release.yml](/Users/michaelpoage/Work/gstackqlite_hypervisor/.github/workflows/release.yml). CI is in [ci.yml](/Users/michaelpoage/Work/gstackqlite_hypervisor/.github/workflows/ci.yml).
 
 ## Run
 
@@ -132,7 +158,7 @@ cargo run -- upgrade --outdated
 - `d`: dry-run apply of the selected version to the selected project
 - `a`: apply the selected version to the selected project
 - `m`: toggle the generated lo-fi loop
-- `t`: cycle tracks (`Palo Alto Dawn`, `SoMa Afterhours`, `Shibuya Rain`)
+- `t`: cycle tracks (`Palo Alto Dawn`, `SoMa Afterhours`, `Shibuya Rain`, `Shenzhen Circuit`, `Seoul Rooftops`, `Flatiron Bebop`)
 - `c`: cycle terminal themes (`Sandhill Sandstone`, `Singapore Harbor`, `Bengaluru Garden`, `Shoreditch Neon`)
 - `r`: refresh the catalog view
 
