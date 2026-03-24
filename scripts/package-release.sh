@@ -18,6 +18,8 @@ mkdir -p "${package_dir}"
 
 cp "target/${TARGET}/release/${BINARY_NAME}" "${package_dir}/"
 cp README.md "${package_dir}/"
+cp scripts/install.sh "${package_dir}/install.sh"
+cp scripts/install.ps1 "${package_dir}/install.ps1"
 if [[ -f LICENSE ]]; then
   cp LICENSE "${package_dir}/"
 fi

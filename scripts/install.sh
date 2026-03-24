@@ -5,12 +5,15 @@ BINARY_NAME="gstackqlite-hypervisor"
 DEFAULT_INSTALL_DIR="${HOME}/.local/bin"
 INSTALL_DIR="${GSTACKQLITE_HYPERVISOR_INSTALL_DIR:-${GSTACK_HYPERVISOR_INSTALL_DIR:-${DEFAULT_INSTALL_DIR}}}"
 VERSION="${GSTACKQLITE_HYPERVISOR_VERSION:-${GSTACK_HYPERVISOR_VERSION:-latest}}"
-REPOSITORY="${GSTACKQLITE_HYPERVISOR_REPO:-${GSTACK_HYPERVISOR_REPO:-}}"
+REPOSITORY="${GSTACKQLITE_HYPERVISOR_REPO:-${GSTACK_HYPERVISOR_REPO:-blackman-ai/gstackqlite_hypervisor}}"
 UPDATE_PATH=1
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
+LOCAL_BINARY="${SCRIPT_DIR}/${BINARY_NAME}"
 
 usage() {
   cat <<'EOF'
 Install gstackqlite-hypervisor from a GitHub release.
+If the script is next to a packaged binary, it installs that local copy instead.
 
 Usage:
   install.sh [--repo owner/repo] [--version v0.0.1|latest] [--install-dir /path] [--no-path-update]
@@ -56,11 +59,6 @@ while [[ $# -gt 0 ]]; do
       ;;
   esac
 done
-
-if [[ -z "${REPOSITORY}" ]]; then
-  echo "Set GSTACKQLITE_HYPERVISOR_REPO or pass --repo owner/repo." >&2
-  exit 1
-fi
 
 need_cmd() {
   if ! command -v "$1" >/dev/null 2>&1; then
@@ -196,6 +194,22 @@ temp_dir="$(mktemp -d)"
 archive_path="${temp_dir}/${archive_name}"
 checksums_path="${temp_dir}/SHA256SUMS"
 
+install_binary() {
+  local source_path="$1"
+  mkdir -p "${INSTALL_DIR}"
+  cp "${source_path}" "${INSTALL_DIR}/${BINARY_NAME}"
+  chmod +x "${INSTALL_DIR}/${BINARY_NAME}"
+  maybe_update_path
+  echo "Installed ${BINARY_NAME} to ${INSTALL_DIR}/${BINARY_NAME}"
+  echo "Run '${BINARY_NAME} --help' after opening a new shell, or export PATH=\"${INSTALL_DIR}:\$PATH\" now."
+}
+
+if [[ -f "${LOCAL_BINARY}" ]]; then
+  echo "Installing ${BINARY_NAME} from local package..."
+  install_binary "${LOCAL_BINARY}"
+  exit 0
+fi
+
 if [[ "${VERSION}" == "latest" ]]; then
   release_url="https://github.com/${REPOSITORY}/releases/latest/download"
 else
@@ -219,12 +233,6 @@ fi
 
 mkdir -p "${INSTALL_DIR}"
 tar -xzf "${archive_path}" -C "${temp_dir}"
-cp "${temp_dir}/${BINARY_NAME}-${VERSION#v}-${target}/${BINARY_NAME}" "${INSTALL_DIR}/${BINARY_NAME}"
-chmod +x "${INSTALL_DIR}/${BINARY_NAME}"
-
-maybe_update_path
+install_binary "${temp_dir}/${BINARY_NAME}-${VERSION#v}-${target}/${BINARY_NAME}"
 
 rm -rf "${temp_dir}"
-
-echo "Installed ${BINARY_NAME} to ${INSTALL_DIR}/${BINARY_NAME}"
-echo "Run '${BINARY_NAME} --help' after opening a new shell, or export PATH=\"${INSTALL_DIR}:\$PATH\" now."

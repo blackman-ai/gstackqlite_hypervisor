@@ -67,6 +67,8 @@ jobs:
           New-Item -ItemType Directory -Path $stage -Force | Out-Null
           Copy-Item "target/${env:TARGET}/release/${env:BINARY_NAME}.exe" $stage
           Copy-Item README.md $stage
+          Copy-Item "scripts/install.sh" (Join-Path $stage "install.sh")
+          Copy-Item "scripts/install.ps1" (Join-Path $stage "install.ps1")
           if (Test-Path LICENSE) {
             Copy-Item LICENSE $stage
           }

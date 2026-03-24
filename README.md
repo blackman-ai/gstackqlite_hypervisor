@@ -68,11 +68,10 @@ For a public GitHub repo, the intended release flow is:
 - push a tag like `v0.0.1` to build release archives and publish a GitHub release
 - let users install from the release page or via the installer script
 
-Unix install command:
+Fastest Unix install command:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/blackman-ai/gstackqlite_hypervisor/main/scripts/install.sh | \
-  GSTACKQLITE_HYPERVISOR_REPO=blackman-ai/gstackqlite_hypervisor bash
+curl -fsSL https://raw.githubusercontent.com/blackman-ai/gstackqlite_hypervisor/main/scripts/install.sh | bash
 ```
 
 The installer:
@@ -82,6 +81,12 @@ The installer:
 - verifies the archive checksum before unpacking
 - installs the binary to `~/.local/bin` by default
 - updates `zsh`, `bash`, `fish`, or fallback profile config if that directory is not already on `PATH`
+- can also be run directly from an extracted release archive with `./install.sh`
+
+Manual package install:
+
+- macOS/Linux: download the release archive, extract it, and run `./install.sh`
+- Windows: download the `.zip`, extract it, and run `.\install.ps1`
 
 Release assets are built by [release.yml](/Users/michaelpoage/Work/gstackqlite_hypervisor/.github/workflows/release.yml). CI is in [ci.yml](/Users/michaelpoage/Work/gstackqlite_hypervisor/.github/workflows/ci.yml).
 
