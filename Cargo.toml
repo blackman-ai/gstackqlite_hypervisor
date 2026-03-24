@@ -1,0 +1,19 @@
+[package]
+name = "gstackqlite_hypervisor"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+description = "SQLite-first Rust TUI for managing local gstack installs."
+
+[dependencies]
+anyhow = "1.0.102"
+clap = { version = "4.6.0", features = ["derive"] }
+crossterm = "0.29.0"
+ratatui = "0.30.0"
+rusqlite = { version = "0.39.0", features = ["bundled"] }
+rodio = "0.22.2"
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.149"
+sha1 = "0.11.0-rc.5"
+sha2 = "0.11.0-rc.5"
+walkdir = "2.5.0"
