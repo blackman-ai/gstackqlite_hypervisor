@@ -58,13 +58,18 @@ jobs:
         if: runner.os == 'Windows'
         shell: pwsh
         run: |
+          $ErrorActionPreference = "Stop"
           $version = "${env:VERSION}".TrimStart("v")
           cargo build --release --locked --target "${env:TARGET}"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           New-Item -ItemType Directory -Path dist -Force | Out-Null
           $stage = Join-Path $env:RUNNER_TEMP "${env:BINARY_NAME}-$version-${env:TARGET}"
           New-Item -ItemType Directory -Path $stage -Force | Out-Null
           Copy-Item "target/${env:TARGET}/release/${env:BINARY_NAME}.exe" $stage
           Copy-Item README.md $stage
+          if (Test-Path LICENSE) {
+            Copy-Item LICENSE $stage
+          }
           Compress-Archive -Path (Join-Path $stage '*') -DestinationPath "dist/${env:BINARY_NAME}-$version-${env:TARGET}.zip" -Force
 
       - name: Upload packaged artifact

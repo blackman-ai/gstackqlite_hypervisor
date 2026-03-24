@@ -89,10 +89,10 @@ fn copy_manifest_to(root: &Path, entries: &[LocalManifestEntry], destination: &P
                 fs::copy(&src, &dst)
                     .with_context(|| format!("failed to back up {}", src.display()))?;
             }
-            LocalManifestKind::Symlink(target) => {
+            LocalManifestKind::Symlink(_target) => {
                 #[cfg(unix)]
                 {
-                    std::os::unix::fs::symlink(target, &dst).with_context(|| {
+                    std::os::unix::fs::symlink(_target, &dst).with_context(|| {
                         format!("failed to create backup symlink {}", dst.display())
                     })?;
                 }
@@ -142,10 +142,10 @@ fn write_bytes_with_mode(destination: &Path, mode: &str, content: &[u8]) -> Resu
     }
     let _ = remove_path_if_exists(destination);
     if mode == "120000" {
-        let target = String::from_utf8_lossy(content).to_string();
+        let _target = String::from_utf8_lossy(content).to_string();
         #[cfg(unix)]
         {
-            std::os::unix::fs::symlink(target, destination)?;
+            std::os::unix::fs::symlink(_target, destination)?;
         }
         #[cfg(not(unix))]
         {

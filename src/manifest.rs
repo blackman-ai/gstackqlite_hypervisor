@@ -106,7 +106,10 @@ pub fn collect_local_manifest(root: &Path) -> Result<Vec<LocalManifestEntry>> {
         let mut file = fs::File::open(entry.path())?;
         let mut buffer = Vec::new();
         file.read_to_end(&mut buffer)?;
+        #[cfg(unix)]
         let executable = metadata.permissions().mode() & 0o111 != 0;
+        #[cfg(not(unix))]
+        let executable = false;
         entries.push(LocalManifestEntry {
             path: relative,
             blob_sha: git_blob_sha(&buffer),
