@@ -77,11 +77,19 @@ curl -fsSL https://raw.githubusercontent.com/blackman-ai/gstackqlite_hypervisor/
 The installer:
 
 - detects macOS or Linux target architecture
+- resolves `latest` to the newest GitHub release tag automatically
 - downloads the matching release archive plus `SHA256SUMS`
 - verifies the archive checksum before unpacking
 - installs the binary to `~/.local/bin` by default
 - updates `zsh`, `bash`, `fish`, or fallback profile config if that directory is not already on `PATH`
 - can also be run directly from an extracted release archive with `./install.sh`
+
+Pin a specific release instead of `latest`:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/blackman-ai/gstackqlite_hypervisor/main/scripts/install.sh | \
+  GSTACKQLITE_HYPERVISOR_VERSION=v0.0.2 bash
+```
 
 Manual package install:
 

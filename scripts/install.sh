@@ -7,8 +7,13 @@ INSTALL_DIR="${GSTACKQLITE_HYPERVISOR_INSTALL_DIR:-${GSTACK_HYPERVISOR_INSTALL_D
 VERSION="${GSTACKQLITE_HYPERVISOR_VERSION:-${GSTACK_HYPERVISOR_VERSION:-latest}}"
 REPOSITORY="${GSTACKQLITE_HYPERVISOR_REPO:-${GSTACK_HYPERVISOR_REPO:-blackman-ai/gstackqlite_hypervisor}}"
 UPDATE_PATH=1
-SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
-LOCAL_BINARY="${SCRIPT_DIR}/${BINARY_NAME}"
+SCRIPT_SOURCE="${BASH_SOURCE[0]-}"
+SCRIPT_DIR=""
+LOCAL_BINARY=""
+if [[ -n "${SCRIPT_SOURCE}" && -f "${SCRIPT_SOURCE}" ]]; then
+  SCRIPT_DIR="$(cd -- "$(dirname -- "${SCRIPT_SOURCE}")" && pwd -P)"
+  LOCAL_BINARY="${SCRIPT_DIR}/${BINARY_NAME}"
+fi
 
 usage() {
   cat <<'EOF'
@@ -75,14 +80,36 @@ if command -v curl >/dev/null 2>&1; then
   fetch() {
     curl -fsSL "$1" -o "$2"
   }
+  fetch_text() {
+    curl -fsSL "$1"
+  }
 elif command -v wget >/dev/null 2>&1; then
   fetch() {
     wget -qO "$2" "$1"
+  }
+  fetch_text() {
+    wget -qO- "$1"
   }
 else
   echo "Missing downloader: install curl or wget." >&2
   exit 1
 fi
+
+resolve_version() {
+  if [[ "${VERSION}" != "latest" ]]; then
+    echo "${VERSION}"
+    return
+  fi
+
+  local latest_api tag
+  latest_api="https://api.github.com/repos/${REPOSITORY}/releases/latest"
+  tag="$(fetch_text "${latest_api}" | sed -n 's/.*"tag_name"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | head -n 1)"
+  if [[ -z "${tag}" ]]; then
+    echo "Failed to resolve latest release tag from ${latest_api}" >&2
+    exit 1
+  fi
+  echo "${tag}"
+}
 
 sha256_check() {
   local file="$1"
@@ -188,8 +215,9 @@ maybe_update_path() {
   esac
 }
 
+resolved_version="$(resolve_version)"
 target="$(detect_target)"
-archive_name="${BINARY_NAME}-${VERSION#v}-${target}.tar.gz"
+archive_name="${BINARY_NAME}-${resolved_version#v}-${target}.tar.gz"
 temp_dir="$(mktemp -d)"
 archive_path="${temp_dir}/${archive_name}"
 checksums_path="${temp_dir}/SHA256SUMS"
@@ -204,16 +232,16 @@ install_binary() {
   echo "Run '${BINARY_NAME} --help' after opening a new shell, or export PATH=\"${INSTALL_DIR}:\$PATH\" now."
 }
 
-if [[ -f "${LOCAL_BINARY}" ]]; then
+if [[ -n "${LOCAL_BINARY}" && -f "${LOCAL_BINARY}" ]]; then
   echo "Installing ${BINARY_NAME} from local package..."
   install_binary "${LOCAL_BINARY}"
   exit 0
 fi
 
-if [[ "${VERSION}" == "latest" ]]; then
+if [[ "${resolved_version}" == "latest" ]]; then
   release_url="https://github.com/${REPOSITORY}/releases/latest/download"
 else
-  release_url="https://github.com/${REPOSITORY}/releases/download/${VERSION}"
+  release_url="https://github.com/${REPOSITORY}/releases/download/${resolved_version}"
 fi
 
 echo "Downloading ${archive_name} from ${REPOSITORY}..."
@@ -233,6 +261,6 @@ fi
 
 mkdir -p "${INSTALL_DIR}"
 tar -xzf "${archive_path}" -C "${temp_dir}"
-install_binary "${temp_dir}/${BINARY_NAME}-${VERSION#v}-${target}/${BINARY_NAME}"
+install_binary "${temp_dir}/${BINARY_NAME}-${resolved_version#v}-${target}/${BINARY_NAME}"
 
 rm -rf "${temp_dir}"
