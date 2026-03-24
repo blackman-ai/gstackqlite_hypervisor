@@ -441,8 +441,11 @@ fn render(app: &mut App, terminal: &mut Terminal<CrosstermBackend<Stdout>>) -> R
                 .map(|idea| ListItem::new(format!("[{}] {}", idea.severity, idea.title)))
                 .collect::<Vec<_>>()
         };
-        let ideas = List::new(idea_items)
-            .block(Block::default().title("Recommendations").borders(Borders::ALL));
+        let ideas = List::new(idea_items).block(
+            Block::default()
+                .title("Workspace Recommendations")
+                .borders(Borders::ALL),
+        );
         frame.render_widget(ideas, middle[2]);
 
         let detail_text = if let Some(project) = app.selected_project() {
@@ -500,6 +503,7 @@ fn render(app: &mut App, terminal: &mut Terminal<CrosstermBackend<Stdout>>) -> R
                         .map(|version| version.subject.clone())
                         .unwrap_or_else(|| "Recommendations on the right are catalog suggestions, not commit messages.".to_string())
                 )),
+                Line::from("Right pane: workspace-wide recommendations, not selected-project commit history."),
                 Line::from(match install {
                     Some(install) => format!(
                         "Install state: host={} type={} dirty={} outdated={} matched={}",

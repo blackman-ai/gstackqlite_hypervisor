@@ -34,8 +34,9 @@ pub struct LofiPlayer {
 
 impl LofiPlayer {
     pub fn start() -> Result<Self> {
-        let sink = DeviceSinkBuilder::open_default_sink()
+        let mut sink = DeviceSinkBuilder::open_default_sink()
             .with_context(|| "failed to open a default audio output device")?;
+        sink.log_on_drop(false);
         let player = Player::connect_new(&sink.mixer());
         let source = SamplesBuffer::new(
             NonZeroU16::new(2).expect("stereo channel count must be non-zero"),

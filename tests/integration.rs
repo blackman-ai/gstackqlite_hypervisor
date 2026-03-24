@@ -93,7 +93,7 @@ fn ingest_scan_and_upgrade_work_end_to_end() -> Result<()> {
     assert!(
         ideas
             .iter()
-            .any(|idea| idea.title.contains("Upgrade stale"))
+            .any(|idea| idea.title.contains("older local gstack copy"))
     );
 
     let dry_run = materialize_targets(&catalog, None, None, &[], true, true, false)?;
