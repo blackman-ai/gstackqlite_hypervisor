@@ -83,7 +83,7 @@ fn ingest_scan_and_upgrade_work_end_to_end() -> Result<()> {
     fs::write(install_dir.join("README.md"), "# fixture v1\n")?;
     fs::write(install_dir.join("docs").join("note.md"), "first\n")?;
 
-    let scan = scan_local_installs(&catalog, std::slice::from_ref(&workspace), Some(4))?;
+    let scan = scan_local_installs(&catalog, std::slice::from_ref(&project_repo), Some(4))?;
     catalog.record_scan(&scan)?;
     let installs = catalog.list_installs(false, None, None)?;
     assert_eq!(installs.len(), 1);
@@ -156,7 +156,7 @@ fn project_catalog_and_merge_aware_apply_work_end_to_end() -> Result<()> {
     fs::write(install_dir.join("docs").join("note.md"), "first\n")?;
     fs::write(install_dir.join("CUSTOM.md"), "keep me\n")?;
 
-    let scan = scan_local_installs(&catalog, std::slice::from_ref(&workspace), Some(4))?;
+    let scan = scan_local_installs(&catalog, std::slice::from_ref(&project_repo), Some(4))?;
     catalog.record_scan(&scan)?;
 
     let projects = catalog.list_projects()?;
@@ -293,7 +293,7 @@ fn codex_project_markers_are_detected() -> Result<()> {
     fs::write(install_dir.join("README.md"), "# codex local fixture v1\n")?;
     fs::write(install_dir.join("docs").join("note.md"), "first\n")?;
 
-    let scan = scan_local_installs(&catalog, std::slice::from_ref(&workspace), Some(4))?;
+    let scan = scan_local_installs(&catalog, std::slice::from_ref(&project_repo), Some(4))?;
     catalog.record_scan(&scan)?;
 
     let projects = catalog.list_projects()?;
@@ -320,6 +320,68 @@ fn codex_project_markers_are_detected() -> Result<()> {
     let installs = catalog.list_installs(false, None, None)?;
     assert_eq!(installs.len(), 1);
     assert_eq!(installs[0].host.as_str(), "codex");
+
+    Ok(())
+}
+
+#[test]
+fn plain_git_repos_are_cataloged_and_ready_for_install() -> Result<()> {
+    let workspace = temp_dir("gstack-hypervisor-git-project-test");
+    let upstream_repo = workspace.join("upstream");
+    let project_repo = workspace.join("git-only-project");
+    let db_path = workspace.join("catalog.sqlite");
+
+    init_fixture_repo(&upstream_repo)?;
+    let catalog = Catalog::new(&db_path)?;
+    ingest_upstream(
+        &catalog,
+        Some(upstream_repo.to_str().unwrap()),
+        Some("HEAD"),
+    )?;
+
+    fs::create_dir_all(&project_repo)?;
+    run(&project_repo, &["init"])?;
+    run(&project_repo, &["config", "user.name", "Test User"])?;
+    run(&project_repo, &["config", "user.email", "test@example.com"])?;
+    fs::write(project_repo.join("README.md"), "# plain repo\n")?;
+    run(&project_repo, &["add", "README.md"])?;
+    run(&project_repo, &["commit", "-m", "plain repo init"])?;
+
+    let scan = scan_local_installs(&catalog, std::slice::from_ref(&project_repo), Some(4))?;
+    catalog.record_scan(&scan)?;
+
+    let projects = catalog.list_projects()?;
+    assert_eq!(projects.len(), 1);
+    assert!(projects[0].has_git_repo);
+    assert!(!projects[0].has_claude_md);
+    assert!(!projects[0].has_claude_dir);
+    assert!(!projects[0].has_claude_settings);
+    assert!(!projects[0].has_agents_md);
+    assert!(!projects[0].has_agents_dir);
+    assert!(!projects[0].has_codex_dir);
+    assert!(!projects[0].has_codex_settings);
+    assert_eq!(projects[0].effective_gstack_source, "none");
+    assert_eq!(projects[0].effective_gstack_version, None);
+
+    let project_identifier = vec![projects[0].id.to_string()];
+    let dry_run =
+        apply_version_to_projects(&catalog, Some("0.0.2.0"), None, &project_identifier, true)?;
+    assert_eq!(dry_run.len(), 1);
+    let canonical_project_repo = fs::canonicalize(&project_repo)?;
+    assert_eq!(
+        dry_run[0].install_path,
+        canonical_project_repo
+            .join(".claude")
+            .join("skills")
+            .join("gstack")
+            .to_string_lossy()
+    );
+    assert!(
+        dry_run[0]
+            .applied_files
+            .iter()
+            .any(|path| path == "VERSION")
+    );
 
     Ok(())
 }

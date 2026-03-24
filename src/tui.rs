@@ -59,7 +59,7 @@ struct Theme {
 const THEMES: [Theme; 4] = [
     Theme {
         id: "sandhill_sandstone",
-        name: "Sandhill Sandstone",
+        name: "Sand Hill Sandstone",
         accent: Color::Yellow,
         accent_soft: Color::LightYellow,
         text: Color::White,
@@ -603,12 +603,90 @@ fn matches_query(fields: &[String], query: &str) -> bool {
     terms.iter().all(|term| haystack.contains(term))
 }
 
+fn project_state_key(project: &CatalogProject) -> &'static str {
+    match project.effective_gstack_source.as_str() {
+        "local_install" => "local_install",
+        "global_install" => "global_install",
+        "none" if project.has_git_repo => "ready_to_install",
+        "none" => "configured_without_install",
+        _ => "unknown",
+    }
+}
+
+fn project_state_rank(project: &CatalogProject) -> usize {
+    match project_state_key(project) {
+        "local_install" => 0,
+        "global_install" => 1,
+        "ready_to_install" => 2,
+        "configured_without_install" => 3,
+        _ => 4,
+    }
+}
+
+fn project_status_label(project: &CatalogProject) -> String {
+    match project_state_key(project) {
+        "local_install" => project
+            .effective_gstack_version
+            .as_ref()
+            .map(|version| format!("local {version}"))
+            .unwrap_or_else(|| "local".to_string()),
+        "global_install" => project
+            .effective_gstack_version
+            .as_ref()
+            .map(|version| format!("global {version}"))
+            .unwrap_or_else(|| "global".to_string()),
+        "ready_to_install" => "ready".to_string(),
+        "configured_without_install" => "configured".to_string(),
+        _ => "unknown".to_string(),
+    }
+}
+
+fn project_current_gstack_line(project: &CatalogProject) -> String {
+    match project_state_key(project) {
+        "local_install" => format!(
+            "Current gstack: repo-local {} install={}",
+            project
+                .effective_gstack_version
+                .clone()
+                .unwrap_or_else(|| "unmapped".to_string()),
+            project
+                .gstack_install_observed_path
+                .clone()
+                .unwrap_or_else(|| "-".to_string())
+        ),
+        "global_install" => format!(
+            "Current gstack: inherited global {}",
+            project
+                .effective_gstack_version
+                .clone()
+                .unwrap_or_else(|| "unmapped".to_string())
+        ),
+        "ready_to_install" => {
+            "Current gstack: no install yet; this repo is ready for a local gstack install"
+                .to_string()
+        }
+        "configured_without_install" => {
+            "Current gstack: Claude/Codex settings detected, but no gstack install is cataloged yet"
+                .to_string()
+        }
+        _ => format!(
+            "Current gstack: source={} version={} install={}",
+            project.effective_gstack_source,
+            project
+                .effective_gstack_version
+                .clone()
+                .unwrap_or_else(|| "-".to_string()),
+            project
+                .gstack_install_observed_path
+                .clone()
+                .unwrap_or_else(|| "-".to_string())
+        ),
+    }
+}
+
 fn filter_projects(projects: &[CatalogProject], query: &str) -> Vec<CatalogProject> {
     let query = trim_query(query);
-    if query.is_empty() {
-        return projects.to_vec();
-    }
-    projects
+    let mut filtered = projects
         .iter()
         .filter(|project| {
             matches_query(
@@ -619,19 +697,36 @@ fn filter_projects(projects: &[CatalogProject], query: &str) -> Vec<CatalogProje
                     project
                         .effective_gstack_version
                         .clone()
-                        .unwrap_or_else(|| "unknown".to_string()),
+                        .unwrap_or_else(|| "not_installed".to_string()),
+                    project_status_label(project),
+                    project_state_key(project).to_string(),
                     project.effective_gstack_source.clone(),
+                    if project.has_git_repo {
+                        "git_repo".to_string()
+                    } else {
+                        "marker_only".to_string()
+                    },
                     project
                         .gstack_install_observed_path
                         .clone()
                         .unwrap_or_default(),
                     project.claude_settings_paths.join(" "),
+                    project.codex_settings_paths.join(" "),
+                    project.git_remote.clone().unwrap_or_default(),
                 ],
                 query,
             )
         })
         .cloned()
-        .collect()
+        .collect::<Vec<_>>();
+    filtered.sort_by_key(|project| {
+        (
+            project_state_rank(project),
+            project.name.to_ascii_lowercase(),
+            project.canonical_path.to_ascii_lowercase(),
+        )
+    });
+    filtered
 }
 
 fn filter_versions(versions: &[CatalogVersion], query: &str) -> Vec<CatalogVersion> {
@@ -855,20 +950,15 @@ fn render(app: &mut App, terminal: &mut Terminal<CrosstermBackend<Stdout>>) -> R
             .split(areas[1]);
 
         let project_items = if app.projects.is_empty() {
-            vec![ListItem::new("No Claude/Codex projects in catalog.")]
+            vec![ListItem::new("No git/Claude/Codex projects in catalog.")]
         } else {
             app.projects
                 .iter()
                 .map(|project| {
                     ListItem::new(format!(
-                        "#{} {} [{}] v{} {}",
-                        project.id,
+                        "{} [{}] {}",
                         project.name,
-                        project.effective_gstack_source,
-                        project
-                            .effective_gstack_version
-                            .clone()
-                            .unwrap_or_else(|| "unknown".to_string()),
+                        project_status_label(project),
                         project.canonical_path
                     ))
                 })
@@ -1043,7 +1133,7 @@ fn build_help_lines(app: &App, theme: Theme) -> Vec<Line<'static>> {
         Line::from(""),
         Line::from("Panes"),
         Line::from(
-            "  Projects lists Claude/Codex repos and their effective gstack source/version.",
+            "  Projects lists repos sorted by install state, then name. Row labels are local, global, ready, or configured.",
         ),
         Line::from(
             "  Versions lists upstream gstack versions from SQLite; the right pane shows commit context and file delta.",
@@ -1178,8 +1268,16 @@ fn build_project_detail(app: &App, theme: Theme) -> Vec<Line<'static>> {
     let context = app.version_context.as_ref();
 
     vec![
-        Line::from(format!("Project: #{} {}", project.id, project.name)),
+        Line::from(format!("Project: {}", project.name)),
         Line::from(format!("Path: {}", project.canonical_path)),
+        Line::from(format!(
+            "Repository: git_repo={} remote={}",
+            project.has_git_repo,
+            project
+                .git_remote
+                .clone()
+                .unwrap_or_else(|| "-".to_string())
+        )),
         Line::from(format!(
             "Claude markers: CLAUDE.md={} .claude={} settings={} paths={}",
             project.has_claude_md,
@@ -1203,18 +1301,7 @@ fn build_project_detail(app: &App, theme: Theme) -> Vec<Line<'static>> {
                 project.codex_settings_paths.join(", ")
             }
         )),
-        Line::from(format!(
-            "Current gstack: source={} version={} install={}",
-            project.effective_gstack_source,
-            project
-                .effective_gstack_version
-                .clone()
-                .unwrap_or_else(|| "unknown".to_string()),
-            project
-                .gstack_install_observed_path
-                .clone()
-                .unwrap_or_else(|| "-".to_string())
-        )),
+        Line::from(project_current_gstack_line(project)),
         Line::from(format!(
             "Selected target: {} ({})",
             target
@@ -1351,7 +1438,7 @@ pub fn run(catalog: Catalog) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{filter_projects, filter_versions};
+    use super::{filter_projects, filter_versions, project_status_label};
     use crate::models::{CatalogProject, CatalogVersion};
 
     fn sample_project(
@@ -1366,6 +1453,7 @@ mod tests {
             canonical_path: path.to_string(),
             name: name.to_string(),
             git_remote: None,
+            has_git_repo: true,
             has_claude_md: false,
             has_claude_dir: true,
             has_claude_settings: true,
@@ -1417,6 +1505,37 @@ mod tests {
         assert_eq!(filter_projects(&projects, "startup 0.11.10").len(), 1);
         assert_eq!(filter_projects(&projects, "Work local_install").len(), 1);
         assert!(filter_projects(&projects, "missing value").is_empty());
+    }
+
+    #[test]
+    fn projects_are_sorted_by_state_then_name() {
+        let local = sample_project(
+            1,
+            "jenkins-chat",
+            "/Users/example/Work/jenkins-chat",
+            Some("0.8.6"),
+            "local_install",
+        );
+        let ready = sample_project(
+            2,
+            "startup_world",
+            "/Users/example/Work/startup_world",
+            None,
+            "none",
+        );
+        let mut configured =
+            sample_project(3, "advisory", "/Users/example/Work/advisory", None, "none");
+        configured.has_git_repo = false;
+
+        let sorted = filter_projects(&[ready.clone(), configured.clone(), local.clone()], "");
+        let names = sorted
+            .iter()
+            .map(|project| project.name.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(names, vec!["jenkins-chat", "startup_world", "advisory"]);
+        assert_eq!(project_status_label(&ready), "ready");
+        assert_eq!(project_status_label(&configured), "configured");
+        assert_eq!(project_status_label(&local), "local 0.8.6");
     }
 
     #[test]

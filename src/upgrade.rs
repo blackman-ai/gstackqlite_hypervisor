@@ -345,10 +345,17 @@ fn build_install_map(catalog: &Catalog) -> Result<HashMap<i64, CatalogInstall>> 
 }
 
 fn default_project_install_path(project: &crate::models::CatalogProject) -> PathBuf {
-    PathBuf::from(&project.canonical_path)
-        .join(".claude")
-        .join("skills")
-        .join("gstack")
+    let base = PathBuf::from(&project.canonical_path);
+    if project.has_claude_dir || project.has_claude_md || project.has_claude_settings {
+        return base.join(".claude").join("skills").join("gstack");
+    }
+    if project.has_codex_dir || project.has_codex_settings {
+        return base.join(".codex").join("skills").join("gstack");
+    }
+    if project.has_agents_md || project.has_agents_dir {
+        return base.join(".agents").join("skills").join("gstack");
+    }
+    base.join(".claude").join("skills").join("gstack")
 }
 
 fn resolve_project_install(

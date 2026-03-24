@@ -18,12 +18,15 @@ It treats Git as an ingestion transport only:
   - upstream commit metadata
   - per-commit file manifests
   - cached blob contents for materializing snapshots
-  - Claude/Codex project records
+  - git, Claude, and Codex project records
   - local install records
   - scan history
   - apply and sync history
 - local discovery for:
+  - git repos, even before Claude/Codex setup
   - projects with `CLAUDE.md`
+  - projects with `AGENTS.md`
+  - projects with `.codex/config.toml`, `.codex/config.json`, `.codex/settings.toml`, `.codex/settings.json`, `.codex/settings.yaml`, or `.codex/settings.yml`
   - projects with `.claude/settings.json`, `.claude/settings.local.json`, `.claude/settings.yaml`, or `.claude/settings.yml`
   - `~/.claude/skills/gstack`
   - `~/.codex/skills/gstack`
@@ -81,7 +84,7 @@ Sync upstream history plus local project/install state:
 cargo run -- sync --root ~/Work --root ~/src
 ```
 
-List Claude/Codex projects:
+List discovered git/Claude/Codex projects:
 
 ```bash
 cargo run -- projects
@@ -160,7 +163,7 @@ cargo run -- upgrade --outdated
 - `a`: apply the selected version to the selected project
 - `m`: toggle the generated lo-fi loop
 - `t`: cycle tracks (`Palo Alto Dawn`, `SoMa Afterhours`, `Shibuya Rain`, `Shenzhen Circuit`, `Seoul Rooftops`, `Flatiron Bebop`)
-- `c`: cycle terminal themes (`Sandhill Sandstone`, `Singapore Harbor`, `Bengaluru Garden`, `Shoreditch Neon`)
+- `c`: cycle terminal themes (`Sand Hill Sandstone`, `Singapore Harbor`, `Bengaluru Garden`, `Shoreditch Neon`)
 - `r`: refresh the catalog view
 
 ## Storage

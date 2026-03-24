@@ -137,6 +137,7 @@ fn discover_project(
     global_claude_install: Option<&DiscoveredInstall>,
     global_codex_install: Option<&DiscoveredInstall>,
 ) -> Option<DiscoveredProject> {
+    let has_git_repo = project_path.join(".git").exists();
     let claude_md = project_path.join("CLAUDE.md");
     let claude_dir = project_path.join(".claude");
     let agents_md = project_path.join("AGENTS.md");
@@ -174,7 +175,8 @@ fn discover_project(
     let has_agents_dir = agents_dir.exists();
     let has_codex_settings = !codex_settings_paths.is_empty();
 
-    if !has_claude_md
+    if !has_git_repo
+        && !has_claude_md
         && !has_claude_dir
         && !has_claude_settings
         && !has_agents_md
@@ -220,6 +222,7 @@ fn discover_project(
             .unwrap_or("project")
             .to_string(),
         git_remote: git::remote_origin(project_path),
+        has_git_repo,
         has_claude_md,
         has_claude_dir,
         has_claude_settings,
