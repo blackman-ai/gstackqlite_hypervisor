@@ -150,6 +150,7 @@ cargo run -- upgrade --outdated
 ## TUI keys
 
 - `q`: quit
+- `h` or `?`: open or close the in-app help modal
 - `g`: sync upstream plus local project/install state
 - `tab`: switch between the project list and version list
 - `/`: start filtering the focused list

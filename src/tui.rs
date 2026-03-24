@@ -13,7 +13,7 @@ use ratatui::backend::CrosstermBackend;
 use ratatui::layout::{Constraint, Direction, Layout};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, List, ListItem, ListState, Paragraph, Wrap};
+use ratatui::widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph, Wrap};
 
 use crate::config::{DEFAULT_MAX_DEPTH, default_scan_roots};
 use crate::db::Catalog;
@@ -132,6 +132,7 @@ struct App {
     theme_index: usize,
     track_index: usize,
     music_enabled: bool,
+    show_help: bool,
     lofi: Option<LofiPlayer>,
     music_started_at: Option<Instant>,
     status: String,
@@ -160,6 +161,7 @@ impl App {
             theme_index: 0,
             track_index: 0,
             music_enabled: true,
+            show_help: false,
             lofi: None,
             music_started_at: None,
             status: "starting catalog bootstrap".to_string(),
@@ -414,6 +416,15 @@ impl App {
             }
         }
         let _ = self.refresh();
+    }
+
+    fn toggle_help(&mut self) {
+        self.show_help = !self.show_help;
+        self.status = if self.show_help {
+            "help open: press h, ?, enter, or esc to close".to_string()
+        } else {
+            "help closed".to_string()
+        };
     }
 
     fn start_track(&mut self, track: TrackKind, user_facing_message: &str) {
@@ -712,6 +723,30 @@ fn pane_title(base: &str, visible: usize, total: usize, filter: &str, editing: b
     title
 }
 
+fn centered_area(
+    area: ratatui::layout::Rect,
+    horizontal_percent: u16,
+    vertical_percent: u16,
+) -> ratatui::layout::Rect {
+    let vertical = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Percentage((100 - vertical_percent) / 2),
+            Constraint::Percentage(vertical_percent),
+            Constraint::Percentage((100 - vertical_percent) / 2),
+        ])
+        .split(area);
+    let horizontal = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([
+            Constraint::Percentage((100 - horizontal_percent) / 2),
+            Constraint::Percentage(horizontal_percent),
+            Constraint::Percentage((100 - horizontal_percent) / 2),
+        ])
+        .split(vertical[1]);
+    horizontal[1]
+}
+
 fn render(app: &mut App, terminal: &mut Terminal<CrosstermBackend<Stdout>>) -> Result<()> {
     terminal.draw(|frame| {
         let theme = app.current_theme();
@@ -793,7 +828,7 @@ fn render(app: &mut App, terminal: &mut Terminal<CrosstermBackend<Stdout>>) -> R
                 ),
             ),
             Line::from(
-                "Keys: q quit | g sync | / filter | f clear | m music | t track | c theme | tab switch | j/k move | d dry-run | a apply | r refresh",
+                "Keys: q quit | h help | g sync | / filter | f clear | m music | t track | c theme | tab switch | j/k move | d dry-run | a apply | r refresh",
             ),
             Line::from(Span::styled(
                 app.status.clone(),
@@ -895,6 +930,15 @@ fn render(app: &mut App, terminal: &mut Terminal<CrosstermBackend<Stdout>>) -> R
             .block(block("Project Detail", theme, false))
             .wrap(Wrap { trim: true });
         frame.render_widget(detail, areas[2]);
+
+        if app.show_help {
+            let help_area = centered_area(frame.area(), 62, 68);
+            let help = Paragraph::new(build_help_lines(app, theme))
+                .block(block("Help", theme, true))
+                .wrap(Wrap { trim: true });
+            frame.render_widget(Clear, help_area);
+            frame.render_widget(help, help_area);
+        }
     })?;
     Ok(())
 }
@@ -949,6 +993,65 @@ fn build_visualizer_lines(app: &App, theme: Theme) -> Vec<Line<'static>> {
         lines.push(Line::from(spans));
     }
     lines
+}
+
+fn build_help_lines(app: &App, theme: Theme) -> Vec<Line<'static>> {
+    let focus_label = app.focus.label();
+    let project_filter = display_filter(&app.project_filter);
+    let version_filter = display_filter(&app.version_filter);
+
+    vec![
+        Line::from(Span::styled(
+            "Workspace navigator for local gstack installs and upstream versions.",
+            Style::default()
+                .fg(theme.accent_soft)
+                .add_modifier(Modifier::BOLD),
+        )),
+        Line::from(""),
+        Line::from("Navigation"),
+        Line::from(format!(
+            "  tab switches focus between Projects and Versions. Current focus: {focus_label}."
+        )),
+        Line::from("  j / k or arrow keys move the current selection."),
+        Line::from("  h, ?, enter, or esc closes this help modal."),
+        Line::from(""),
+        Line::from("Filters"),
+        Line::from(format!(
+            "  / starts filtering the focused pane. Active filters: projects=/{project_filter}, versions=/{version_filter}."
+        )),
+        Line::from(
+            "  Type while filtering for live search across names, paths, versions, SHAs, and commit text.",
+        ),
+        Line::from(
+            "  f clears the focused pane filter. ctrl+u clears while you are actively typing a filter.",
+        ),
+        Line::from(""),
+        Line::from("Actions"),
+        Line::from("  g syncs upstream gstack history and rescans local projects."),
+        Line::from("  d dry-runs the selected version against the selected project."),
+        Line::from("  a applies the selected version with merge-aware updates and backups."),
+        Line::from("  r refreshes the catalog view from SQLite."),
+        Line::from(""),
+        Line::from("Audio and Theme"),
+        Line::from(format!(
+            "  m toggles music. Current track: {}. Current theme: {}.",
+            app.current_track().name(),
+            app.current_theme().name
+        )),
+        Line::from("  t cycles tracks. c cycles terminal color palettes."),
+        Line::from("  Theme, track, and music on/off now persist across sessions."),
+        Line::from(""),
+        Line::from("Panes"),
+        Line::from(
+            "  Projects lists Claude-enabled repos and their effective gstack source/version.",
+        ),
+        Line::from(
+            "  Versions lists upstream gstack versions from SQLite; the right pane shows commit context and file delta.",
+        ),
+        Line::from(
+            "  Project Detail shows the selected project's install state and what the selected target would change.",
+        ),
+    ]
 }
 
 fn excerpt_body(body: &str, max_lines: usize) -> Vec<String> {
@@ -1173,9 +1276,20 @@ fn run_loop(app: &mut App, terminal: &mut Terminal<CrosstermBackend<Stdout>>) ->
         render(app, terminal)?;
         if event::poll(Duration::from_millis(200))? {
             if let Event::Key(key) = event::read()? {
+                if app.show_help {
+                    match key.code {
+                        KeyCode::Char('h') | KeyCode::Char('?') | KeyCode::Esc | KeyCode::Enter => {
+                            app.toggle_help()
+                        }
+                        _ => {}
+                    }
+                    continue;
+                }
+
                 match app.input_mode {
                     InputMode::Normal => match key.code {
                         KeyCode::Char('q') => break,
+                        KeyCode::Char('h') | KeyCode::Char('?') => app.toggle_help(),
                         KeyCode::Char('g') => app.sync_now(),
                         KeyCode::Char('/') => app.begin_filter(),
                         KeyCode::Char('f') => app.clear_filter(app.focus),
