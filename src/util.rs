@@ -70,11 +70,11 @@ pub fn hex_encode(bytes: &[u8]) -> String {
 }
 
 pub fn timestamp_slug() -> String {
-    let millis = SystemTime::now()
+    let nanos = SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .map(|duration| duration.as_millis())
+        .map(|duration| duration.as_nanos())
         .unwrap_or_default();
-    millis.to_string()
+    nanos.to_string()
 }
 
 pub fn default_db_path() -> PathBuf {

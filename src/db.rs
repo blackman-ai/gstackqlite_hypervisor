@@ -39,6 +39,7 @@ impl Catalog {
             conn,
         };
         catalog.initialize_schema()?;
+        catalog.migrate_schema()?;
         catalog.ensure_default_source()?;
         Ok(catalog)
     }
@@ -133,6 +134,11 @@ impl Catalog {
               has_claude_dir INTEGER NOT NULL,
               has_claude_settings INTEGER NOT NULL,
               claude_settings_paths_json TEXT NOT NULL,
+              has_agents_md INTEGER NOT NULL DEFAULT 0,
+              has_agents_dir INTEGER NOT NULL DEFAULT 0,
+              has_codex_dir INTEGER NOT NULL DEFAULT 0,
+              has_codex_settings INTEGER NOT NULL DEFAULT 0,
+              codex_settings_paths_json TEXT NOT NULL DEFAULT '[]',
               gstack_install_id INTEGER REFERENCES local_installs(id),
               gstack_install_observed_path TEXT,
               effective_gstack_version TEXT,
@@ -185,6 +191,38 @@ impl Catalog {
             CREATE INDEX IF NOT EXISTS idx_projects_effective_gstack_version ON projects(effective_gstack_version);
             "#,
         )?;
+        Ok(())
+    }
+
+    fn migrate_schema(&self) -> Result<()> {
+        self.ensure_column_exists("projects", "has_agents_md", "INTEGER NOT NULL DEFAULT 0")?;
+        self.ensure_column_exists("projects", "has_agents_dir", "INTEGER NOT NULL DEFAULT 0")?;
+        self.ensure_column_exists("projects", "has_codex_dir", "INTEGER NOT NULL DEFAULT 0")?;
+        self.ensure_column_exists(
+            "projects",
+            "has_codex_settings",
+            "INTEGER NOT NULL DEFAULT 0",
+        )?;
+        self.ensure_column_exists(
+            "projects",
+            "codex_settings_paths_json",
+            "TEXT NOT NULL DEFAULT '[]'",
+        )?;
+        Ok(())
+    }
+
+    fn ensure_column_exists(&self, table: &str, column: &str, definition: &str) -> Result<()> {
+        let pragma = format!("PRAGMA table_info({table})");
+        let mut statement = self.conn.prepare(&pragma)?;
+        let rows = statement.query_map([], |row| row.get::<_, String>(1))?;
+        for row in rows {
+            if row? == column {
+                return Ok(());
+            }
+        }
+
+        let sql = format!("ALTER TABLE {table} ADD COLUMN {column} {definition}");
+        self.conn.execute(&sql, [])?;
         Ok(())
     }
 
@@ -683,9 +721,11 @@ impl Catalog {
                 conn.execute(
                     "UPDATE projects
                      SET name = ?1, git_remote = ?2, has_claude_md = ?3, has_claude_dir = ?4, has_claude_settings = ?5,
-                         claude_settings_paths_json = ?6, gstack_install_id = ?7, gstack_install_observed_path = ?8,
-                         effective_gstack_version = ?9, effective_gstack_source = ?10, last_seen_at = ?11
-                     WHERE id = ?12",
+                         claude_settings_paths_json = ?6, has_agents_md = ?7, has_agents_dir = ?8,
+                         has_codex_dir = ?9, has_codex_settings = ?10, codex_settings_paths_json = ?11,
+                         gstack_install_id = ?12, gstack_install_observed_path = ?13,
+                         effective_gstack_version = ?14, effective_gstack_source = ?15, last_seen_at = ?16
+                     WHERE id = ?17",
                     params![
                         project.name,
                         project.git_remote,
@@ -693,6 +733,11 @@ impl Catalog {
                         bool_to_sql(project.has_claude_dir),
                         bool_to_sql(project.has_claude_settings),
                         serde_json::to_string(&project.claude_settings_paths)?,
+                        bool_to_sql(project.has_agents_md),
+                        bool_to_sql(project.has_agents_dir),
+                        bool_to_sql(project.has_codex_dir),
+                        bool_to_sql(project.has_codex_settings),
+                        serde_json::to_string(&project.codex_settings_paths)?,
                         gstack_install_id,
                         project.gstack_install_observed_path,
                         project.effective_gstack_version,
@@ -707,9 +752,10 @@ impl Catalog {
                 conn.execute(
                     "INSERT INTO projects (
                         canonical_path, name, git_remote, has_claude_md, has_claude_dir, has_claude_settings,
-                        claude_settings_paths_json, gstack_install_id, gstack_install_observed_path,
+                        claude_settings_paths_json, has_agents_md, has_agents_dir, has_codex_dir,
+                        has_codex_settings, codex_settings_paths_json, gstack_install_id, gstack_install_observed_path,
                         effective_gstack_version, effective_gstack_source, first_seen_at, last_seen_at
-                     ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+                     ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18)",
                     params![
                         project.canonical_path,
                         project.name,
@@ -718,6 +764,11 @@ impl Catalog {
                         bool_to_sql(project.has_claude_dir),
                         bool_to_sql(project.has_claude_settings),
                         serde_json::to_string(&project.claude_settings_paths)?,
+                        bool_to_sql(project.has_agents_md),
+                        bool_to_sql(project.has_agents_dir),
+                        bool_to_sql(project.has_codex_dir),
+                        bool_to_sql(project.has_codex_settings),
+                        serde_json::to_string(&project.codex_settings_paths)?,
                         gstack_install_id,
                         project.gstack_install_observed_path,
                         project.effective_gstack_version,
@@ -743,6 +794,11 @@ impl Catalog {
                 serde_json::to_string(&json!({
                     "canonical_path": project.canonical_path,
                     "claude_settings_paths": project.claude_settings_paths,
+                    "codex_settings_paths": project.codex_settings_paths,
+                    "has_agents_md": project.has_agents_md,
+                    "has_agents_dir": project.has_agents_dir,
+                    "has_codex_dir": project.has_codex_dir,
+                    "has_codex_settings": project.has_codex_settings,
                     "effective_gstack_source": project.effective_gstack_source,
                     "gstack_install_observed_path": project.gstack_install_observed_path,
                 }))?
@@ -900,13 +956,15 @@ impl Catalog {
         let mut statement = self.conn.prepare(
             "SELECT
                 id, canonical_path, name, git_remote, has_claude_md, has_claude_dir, has_claude_settings,
-                claude_settings_paths_json, gstack_install_id, gstack_install_observed_path,
+                claude_settings_paths_json, has_agents_md, has_agents_dir, has_codex_dir,
+                has_codex_settings, codex_settings_paths_json, gstack_install_id, gstack_install_observed_path,
                 effective_gstack_version, effective_gstack_source, first_seen_at, last_seen_at
              FROM projects
              ORDER BY canonical_path",
         )?;
         let rows = statement.query_map([], |row| {
             let paths_json: String = row.get(7)?;
+            let codex_paths_json: String = row.get(12)?;
             Ok(CatalogProject {
                 id: row.get(0)?,
                 canonical_path: row.get(1)?,
@@ -916,12 +974,17 @@ impl Catalog {
                 has_claude_dir: row.get::<_, i64>(5)? != 0,
                 has_claude_settings: row.get::<_, i64>(6)? != 0,
                 claude_settings_paths: serde_json::from_str(&paths_json).unwrap_or_default(),
-                gstack_install_id: row.get(8)?,
-                gstack_install_observed_path: row.get(9)?,
-                effective_gstack_version: row.get(10)?,
-                effective_gstack_source: row.get(11)?,
-                first_seen_at: row.get(12)?,
-                last_seen_at: row.get(13)?,
+                has_agents_md: row.get::<_, i64>(8)? != 0,
+                has_agents_dir: row.get::<_, i64>(9)? != 0,
+                has_codex_dir: row.get::<_, i64>(10)? != 0,
+                has_codex_settings: row.get::<_, i64>(11)? != 0,
+                codex_settings_paths: serde_json::from_str(&codex_paths_json).unwrap_or_default(),
+                gstack_install_id: row.get(13)?,
+                gstack_install_observed_path: row.get(14)?,
+                effective_gstack_version: row.get(15)?,
+                effective_gstack_source: row.get(16)?,
+                first_seen_at: row.get(17)?,
+                last_seen_at: row.get(18)?,
             })
         })?;
         let mut projects = Vec::new();

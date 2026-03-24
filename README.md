@@ -18,7 +18,7 @@ It treats Git as an ingestion transport only:
   - upstream commit metadata
   - per-commit file manifests
   - cached blob contents for materializing snapshots
-  - Claude-enabled project records
+  - Claude/Codex project records
   - local install records
   - scan history
   - apply and sync history
@@ -81,7 +81,7 @@ Sync upstream history plus local project/install state:
 cargo run -- sync --root ~/Work --root ~/src
 ```
 
-List Claude-enabled projects:
+List Claude/Codex projects:
 
 ```bash
 cargo run -- projects

@@ -257,3 +257,69 @@ fn project_catalog_and_merge_aware_apply_work_end_to_end() -> Result<()> {
 
     Ok(())
 }
+
+#[test]
+fn codex_project_markers_are_detected() -> Result<()> {
+    let workspace = temp_dir("gstack-hypervisor-codex-project-test");
+    let upstream_repo = workspace.join("upstream");
+    let project_repo = workspace.join("codex-project");
+    let install_dir = project_repo.join(".codex").join("skills").join("gstack");
+    let db_path = workspace.join("catalog.sqlite");
+
+    init_fixture_repo(&upstream_repo)?;
+    let catalog = Catalog::new(&db_path)?;
+    ingest_upstream(
+        &catalog,
+        Some(upstream_repo.to_str().unwrap()),
+        Some("HEAD"),
+    )?;
+
+    fs::create_dir_all(&project_repo)?;
+    run(&project_repo, &["init"])?;
+    run(&project_repo, &["config", "user.name", "Test User"])?;
+    run(&project_repo, &["config", "user.email", "test@example.com"])?;
+    fs::write(
+        project_repo.join("AGENTS.md"),
+        "# Agents\nUse Codex for local workflows.\n",
+    )?;
+    fs::create_dir_all(project_repo.join(".codex"))?;
+    fs::write(
+        project_repo.join(".codex").join("config.toml"),
+        "model = \"gpt-5\"\n",
+    )?;
+
+    fs::create_dir_all(install_dir.join("docs"))?;
+    fs::write(install_dir.join("VERSION"), "0.0.1.0\n")?;
+    fs::write(install_dir.join("README.md"), "# codex local fixture v1\n")?;
+    fs::write(install_dir.join("docs").join("note.md"), "first\n")?;
+
+    let scan = scan_local_installs(&catalog, std::slice::from_ref(&workspace), Some(4))?;
+    catalog.record_scan(&scan)?;
+
+    let projects = catalog.list_projects()?;
+    assert_eq!(projects.len(), 1);
+    assert!(!projects[0].has_claude_md);
+    assert!(!projects[0].has_claude_dir);
+    assert!(!projects[0].has_claude_settings);
+    assert!(projects[0].has_agents_md);
+    assert!(projects[0].has_codex_dir);
+    assert!(!projects[0].has_agents_dir);
+    assert!(projects[0].has_codex_settings);
+    assert_eq!(projects[0].codex_settings_paths.len(), 1);
+    assert!(
+        projects[0].codex_settings_paths[0].ends_with("/codex-project/.codex/config.toml"),
+        "unexpected codex settings path: {}",
+        projects[0].codex_settings_paths[0]
+    );
+    assert_eq!(projects[0].effective_gstack_source, "local_install");
+    assert_eq!(
+        projects[0].effective_gstack_version.as_deref(),
+        Some("0.0.1.0")
+    );
+
+    let installs = catalog.list_installs(false, None, None)?;
+    assert_eq!(installs.len(), 1);
+    assert_eq!(installs[0].host.as_str(), "codex");
+
+    Ok(())
+}

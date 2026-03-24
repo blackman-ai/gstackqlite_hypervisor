@@ -855,7 +855,7 @@ fn render(app: &mut App, terminal: &mut Terminal<CrosstermBackend<Stdout>>) -> R
             .split(areas[1]);
 
         let project_items = if app.projects.is_empty() {
-            vec![ListItem::new("No Claude-enabled projects in catalog.")]
+            vec![ListItem::new("No Claude/Codex projects in catalog.")]
         } else {
             app.projects
                 .iter()
@@ -1043,7 +1043,7 @@ fn build_help_lines(app: &App, theme: Theme) -> Vec<Line<'static>> {
         Line::from(""),
         Line::from("Panes"),
         Line::from(
-            "  Projects lists Claude-enabled repos and their effective gstack source/version.",
+            "  Projects lists Claude/Codex repos and their effective gstack source/version.",
         ),
         Line::from(
             "  Versions lists upstream gstack versions from SQLite; the right pane shows commit context and file delta.",
@@ -1189,6 +1189,18 @@ fn build_project_detail(app: &App, theme: Theme) -> Vec<Line<'static>> {
                 "-".to_string()
             } else {
                 project.claude_settings_paths.join(", ")
+            }
+        )),
+        Line::from(format!(
+            "Codex markers: AGENTS.md={} .codex={} .agents={} settings={} paths={}",
+            project.has_agents_md,
+            project.has_codex_dir,
+            project.has_agents_dir,
+            project.has_codex_settings,
+            if project.codex_settings_paths.is_empty() {
+                "-".to_string()
+            } else {
+                project.codex_settings_paths.join(", ")
             }
         )),
         Line::from(format!(
@@ -1358,6 +1370,11 @@ mod tests {
             has_claude_dir: true,
             has_claude_settings: true,
             claude_settings_paths: vec![format!("{path}/.claude/settings.local.json")],
+            has_agents_md: false,
+            has_agents_dir: false,
+            has_codex_dir: false,
+            has_codex_settings: false,
+            codex_settings_paths: Vec::new(),
             gstack_install_id: None,
             gstack_install_observed_path: Some(format!("{path}/.claude/skills/gstack")),
             effective_gstack_version: version.map(ToOwned::to_owned),

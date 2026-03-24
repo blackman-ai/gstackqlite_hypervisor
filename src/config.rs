@@ -6,8 +6,11 @@ pub const DEFAULT_UPSTREAM_URL: &str = "https://github.com/garrytan/gstack.git";
 pub const DEFAULT_UPSTREAM_REF: &str = "main";
 pub const DEFAULT_MAX_DEPTH: usize = 5;
 
-pub const LOCAL_INSTALL_RELATIVE_PATHS: [&str; 2] =
-    [".claude/skills/gstack", ".agents/skills/gstack"];
+pub const LOCAL_INSTALL_RELATIVE_PATHS: [&str; 3] = [
+    ".claude/skills/gstack",
+    ".agents/skills/gstack",
+    ".codex/skills/gstack",
+];
 pub const LOCAL_MANIFEST_EXCLUDES: [&str; 4] = [".git", "node_modules", "browse/dist", ".DS_Store"];
 pub const REPO_SCAN_SKIP_DIRS: [&str; 9] = [
     ".git",

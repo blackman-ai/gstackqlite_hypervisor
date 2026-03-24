@@ -53,7 +53,9 @@ fn unique_existing_paths(paths: &[PathBuf]) -> Vec<PathBuf> {
 
 fn has_project_markers(path: &Path) -> bool {
     path.join("CLAUDE.md").exists()
+        || path.join("AGENTS.md").exists()
         || path.join(".claude").exists()
+        || path.join(".codex").exists()
         || path.join(".agents").exists()
         || LOCAL_INSTALL_RELATIVE_PATHS
             .iter()
@@ -137,6 +139,9 @@ fn discover_project(
 ) -> Option<DiscoveredProject> {
     let claude_md = project_path.join("CLAUDE.md");
     let claude_dir = project_path.join(".claude");
+    let agents_md = project_path.join("AGENTS.md");
+    let codex_dir = project_path.join(".codex");
+    let agents_dir = project_path.join(".agents");
     let settings_candidates = [
         project_path.join(".claude").join("settings.json"),
         project_path.join(".claude").join("settings.local.json"),
@@ -148,11 +153,35 @@ fn discover_project(
         .filter(|path| path.exists())
         .map(|path| path.to_string_lossy().to_string())
         .collect::<Vec<_>>();
+    let codex_settings_candidates = [
+        project_path.join(".codex").join("config.toml"),
+        project_path.join(".codex").join("config.json"),
+        project_path.join(".codex").join("settings.toml"),
+        project_path.join(".codex").join("settings.json"),
+        project_path.join(".codex").join("settings.yaml"),
+        project_path.join(".codex").join("settings.yml"),
+    ];
+    let codex_settings_paths = codex_settings_candidates
+        .iter()
+        .filter(|path| path.exists())
+        .map(|path| path.to_string_lossy().to_string())
+        .collect::<Vec<_>>();
     let has_claude_md = claude_md.exists();
     let has_claude_dir = claude_dir.exists();
     let has_claude_settings = !settings_paths.is_empty();
+    let has_agents_md = agents_md.exists();
+    let has_codex_dir = codex_dir.exists();
+    let has_agents_dir = agents_dir.exists();
+    let has_codex_settings = !codex_settings_paths.is_empty();
 
-    if !has_claude_md && !has_claude_dir && !has_claude_settings {
+    if !has_claude_md
+        && !has_claude_dir
+        && !has_claude_settings
+        && !has_agents_md
+        && !has_codex_dir
+        && !has_agents_dir
+        && !has_codex_settings
+    {
         return None;
     }
 
@@ -195,6 +224,11 @@ fn discover_project(
         has_claude_dir,
         has_claude_settings,
         claude_settings_paths: settings_paths,
+        has_agents_md,
+        has_agents_dir,
+        has_codex_dir,
+        has_codex_settings,
+        codex_settings_paths,
         gstack_install_observed_path: local_install_path,
         effective_gstack_version: effective_version,
         effective_gstack_source: effective_source,
