@@ -1,5 +1,7 @@
 # gstackqlite_hypervisor
 
+https://github.com/user-attachments/assets/4fa0f946-28f9-4f89-8136-2ff320d6c739
+
 `gstackqlite_hypervisor` is a Rust, SQLite-first local supervisor for [gstack](https://github.com/garrytan/gstack), with a terminal UI and an installable CLI binary named `gstackqlite-hypervisor`.
 
 It treats Git as an ingestion transport only:
