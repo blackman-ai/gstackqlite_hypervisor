@@ -65,7 +65,7 @@ cargo install --path . --bin gstackqlite-hypervisor
 For a public GitHub repo, the intended release flow is:
 
 - push normal branches and PRs to run CI
-- push a tag like `v0.0.1` to build release archives and publish a GitHub release
+- push a tag like `v0.0.4` to build release archives and publish a GitHub release
 - let users install from the release page or via the installer script
 
 Fastest Unix install command:
@@ -82,13 +82,24 @@ The installer:
 - verifies the archive checksum before unpacking
 - installs the binary to `~/.local/bin` by default
 - updates `zsh`, `bash`, `fish`, or fallback profile config if that directory is not already on `PATH`
+- installs Bun automatically if it is missing
+- if neither `claude` nor `codex` is installed yet, prompts you to install `claude`, `codex`, `both`, or `none`
 - can also be run directly from an extracted release archive with `./install.sh`
+
+Control the agent bootstrap non-interactively:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/blackman-ai/gstackqlite_hypervisor/main/scripts/install.sh | \
+  GSTACKQLITE_HYPERVISOR_AGENT_INSTALL=both bash
+```
+
+Accepted values are `claude`, `codex`, `both`, and `none`.
 
 Pin a specific release instead of `latest`:
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/blackman-ai/gstackqlite_hypervisor/main/scripts/install.sh | \
-  GSTACKQLITE_HYPERVISOR_VERSION=v0.0.2 bash
+  GSTACKQLITE_HYPERVISOR_VERSION=v0.0.4 bash
 ```
 
 Manual package install:
@@ -105,6 +116,12 @@ Open the TUI:
 ```bash
 gstackqlite-hypervisor
 ```
+
+On TUI startup:
+
+- if Bun is missing, the app attempts to install it automatically
+- if neither `claude` nor `codex` is installed, a bootstrap modal opens so you can choose `claude`, `codex`, `both`, or `none`
+- press `s` any time to open the System modal for global Claude/Codex defaults and runtime tooling status
 
 Sync upstream history plus local project/install state:
 
@@ -242,10 +259,33 @@ gstackqlite-hypervisor mcp uninstall --global
 gstackqlite-hypervisor mcp uninstall --project ~/Work/my-app
 ```
 
+Inspect the current global gstack defaults for Claude and Codex:
+
+```bash
+gstackqlite-hypervisor default status
+gstackqlite-hypervisor default status --agent claude
+```
+
+Set a specific global default gstack version for Claude, Codex, or both:
+
+```bash
+gstackqlite-hypervisor default set --agent both --version 0.11.10.0
+gstackqlite-hypervisor default set --agent codex --commit f4bbfaa5bdfd
+gstackqlite-hypervisor default set --agent claude --version 0.11.10.0 --dry-run
+```
+
+Those global default installs are materialized into:
+
+- `~/.claude/skills/gstack`
+- `~/.codex/skills/gstack`
+
+and they use the same backup, merge-aware apply, and rescan flow as project-local installs.
+
 ## TUI keys
 
 - `q`: quit
 - `h` or `?`: open or close the in-app help modal
+- `s`: open or close the System modal for global Claude/Codex defaults and bootstrap status
 - `g`: sync upstream plus local project/install state
 - `tab`: switch between the project list and version list
 - `/`: start filtering the focused list
@@ -258,6 +298,23 @@ gstackqlite-hypervisor mcp uninstall --project ~/Work/my-app
 - `z`: dry-run revert from the selected backup-history entry
 - `x`: revert from the selected backup-history entry
 - `m`: toggle the generated lo-fi loop
+- `i` in the System or Bootstrap modal: install or retry missing Bun / agent tooling
+
+Inside the System modal:
+
+- `1`: target Claude global default
+- `2`: target Codex global default
+- `3`: target both Claude and Codex global defaults
+- `d`: dry-run apply the selected upstream version globally
+- `a`: apply the selected upstream version globally
+
+Inside the Bootstrap modal:
+
+- `0`: skip agent install
+- `1`: install Claude Code
+- `2`: install Codex CLI
+- `3`: install both
+- `enter` or `i`: run the bootstrap action
 - `t`: cycle tracks (`Palo Alto Dawn`, `SoMa Afterhours`, `Shibuya Rain`, `Shenzhen Circuit`, `Seoul Rooftops`, `Flatiron Bebop`)
 - `c`: cycle terminal themes (`Sand Hill Sandstone`, `Singapore Harbor`, `Bengaluru Garden`, `Shoreditch Neon`)
 - `r`: refresh the catalog view

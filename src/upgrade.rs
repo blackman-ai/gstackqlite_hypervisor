@@ -5,16 +5,26 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result, anyhow, bail};
 use serde_json::json;
 
-use crate::config::backup_root;
+use crate::config::{backup_root, home_dir};
 use crate::db::Catalog;
 use crate::ingest::hydrate_commit_by_sha;
 use crate::manifest::{LocalManifestEntry, LocalManifestKind, collect_local_manifest};
 use crate::models::{
-    ApplyResult, CatalogInstall, CommitSnapshotFile, DiffPreviewFile, ProjectDiffPreview,
-    RemoveResult, RevertResult, SyncChangeSet, SyncResult,
+    ApplyResult, CatalogInstall, CommitSnapshotFile, DiffPreviewFile, GlobalDefaultApplyResult,
+    GlobalDefaultStatus, HostKind, ProjectDiffPreview, RemoveResult, RevertResult, SyncChangeSet,
+    SyncResult,
 };
 use crate::scan::scan_specific_paths;
-use crate::util::{ensure_dir, timestamp_slug};
+use crate::util::{ensure_dir, real_path_or_original, timestamp_slug};
+
+struct InstallApplyOutcome {
+    applied_files: Vec<String>,
+    preserved_local_files: Vec<String>,
+    merged_files: Vec<String>,
+    conflict_files: Vec<String>,
+    removed_files: Vec<String>,
+    backup_path: Option<PathBuf>,
+}
 
 fn ensure_commit_files_available(
     catalog: &Catalog,
@@ -308,6 +318,10 @@ fn can_merge_text(local: &LocalManifestEntry, target: &CommitSnapshotFile) -> bo
     matches!(local.kind, LocalManifestKind::File) && target.mode != "120000"
 }
 
+fn is_install_metadata_path(path: &str) -> bool {
+    matches!(path, "VERSION" | "browse/dist/.version")
+}
+
 fn merge_text_conflict(local: &[u8], target: &[u8], target_label: &str) -> Option<Vec<u8>> {
     let local_text = String::from_utf8(local.to_vec()).ok()?;
     let target_text = String::from_utf8(target.to_vec()).ok()?;
@@ -497,6 +511,213 @@ fn build_install_map(catalog: &Catalog) -> Result<HashMap<i64, CatalogInstall>> 
         .collect::<HashMap<_, _>>())
 }
 
+fn global_install_path(host: &HostKind) -> PathBuf {
+    match host {
+        HostKind::Claude => home_dir().join(".claude").join("skills").join("gstack"),
+        HostKind::Codex => home_dir().join(".codex").join("skills").join("gstack"),
+        HostKind::Unknown => home_dir().join(".gstack").join("repos").join("gstack"),
+    }
+}
+
+fn install_matches_path(install: &CatalogInstall, target_path: &Path) -> bool {
+    let target = target_path.to_string_lossy().to_string();
+    let resolved = real_path_or_original(target_path)
+        .to_string_lossy()
+        .to_string();
+    install.repository_path.is_none()
+        && (install.observed_path == target
+            || install.observed_path == resolved
+            || install.resolved_path == target
+            || install.resolved_path == resolved)
+}
+
+fn apply_install_contents(
+    install_path: &Path,
+    base_files: &HashMap<String, CommitSnapshotFile>,
+    target_files: &[CommitSnapshotFile],
+    target_commit_sha: &str,
+    target_version: Option<&str>,
+    dry_run: bool,
+    backup_label: &str,
+) -> Result<InstallApplyOutcome> {
+    let target_map = target_files
+        .iter()
+        .map(|file| (file.path.clone(), file.clone()))
+        .collect::<HashMap<_, _>>();
+    let local_entries = collect_local_manifest(install_path)?;
+    let local_map = local_entries
+        .iter()
+        .map(|entry| (entry.path.clone(), entry.clone()))
+        .collect::<HashMap<_, _>>();
+
+    if !dry_run && !target_files.is_empty() {
+        ensure_dir(install_path)?;
+    }
+
+    let mut all_paths = BTreeSet::new();
+    for path in base_files.keys() {
+        all_paths.insert(path.clone());
+    }
+    for path in target_map.keys() {
+        all_paths.insert(path.clone());
+    }
+    for path in local_map.keys() {
+        all_paths.insert(path.clone());
+    }
+
+    let mut applied_files = Vec::new();
+    let mut preserved_local_files = Vec::new();
+    let mut merged_files = Vec::new();
+    let mut conflict_files = Vec::new();
+    let mut removed_files = Vec::new();
+
+    let backup_path = if dry_run {
+        None
+    } else {
+        let backup = backup_root().join(format!("{}-{backup_label}", timestamp_slug()));
+        copy_manifest_to(install_path, &local_entries, &backup)?;
+        Some(backup)
+    };
+
+    for path in all_paths {
+        let local = local_map.get(&path);
+        let base = base_files.get(&path);
+        let target = target_map.get(&path);
+        match (local, base, target) {
+            (None, _, Some(target)) => {
+                applied_files.push(path.clone());
+                if !dry_run {
+                    write_snapshot_file(&install_path.join(&path), target)?;
+                }
+            }
+            (Some(local), Some(base), None) => {
+                if local_matches_commit(local, base) {
+                    removed_files.push(path.clone());
+                    if !dry_run {
+                        remove_path_if_exists(&install_path.join(&path))?;
+                    }
+                } else {
+                    preserved_local_files.push(path.clone());
+                }
+            }
+            (Some(_local), None, None) => {
+                preserved_local_files.push(path.clone());
+            }
+            (Some(local), Some(base), Some(target)) => {
+                if local_matches_commit(local, target) {
+                    continue;
+                }
+                if is_install_metadata_path(&path) {
+                    applied_files.push(path.clone());
+                    if !dry_run {
+                        write_snapshot_file(&install_path.join(&path), target)?;
+                    }
+                    continue;
+                }
+                if local_matches_commit(local, base) {
+                    applied_files.push(path.clone());
+                    if !dry_run {
+                        write_snapshot_file(&install_path.join(&path), target)?;
+                    }
+                } else if base.blob_sha == target.blob_sha && base.mode == target.mode {
+                    preserved_local_files.push(path.clone());
+                } else {
+                    let local_bytes = read_local_entry_content(install_path, local)?;
+                    let target_bytes = target.content.as_deref().unwrap_or_default();
+                    if can_merge_text(local, target) {
+                        if let Some(merged) = merge_text_conflict(
+                            &local_bytes,
+                            target_bytes,
+                            &format!(
+                                "gstack {}",
+                                target_version
+                                    .map(ToOwned::to_owned)
+                                    .unwrap_or_else(|| target_commit_sha.to_string())
+                            ),
+                        ) {
+                            merged_files.push(path.clone());
+                            if !dry_run {
+                                write_bytes_with_mode(
+                                    &install_path.join(&path),
+                                    &target.mode,
+                                    &merged,
+                                )?;
+                            }
+                            continue;
+                        }
+                    }
+                    preserved_local_files.push(path.clone());
+                    conflict_files.push(path.clone());
+                    if !dry_run {
+                        if let Some(backup) = backup_path.as_ref() {
+                            let incoming = backup.join("incoming").join(format!("{path}.incoming"));
+                            write_bytes_with_mode(&incoming, &target.mode, target_bytes)?;
+                        }
+                    }
+                }
+            }
+            (Some(local), None, Some(target)) => {
+                if local_matches_commit(local, target) {
+                    continue;
+                }
+                if is_install_metadata_path(&path) {
+                    applied_files.push(path.clone());
+                    if !dry_run {
+                        write_snapshot_file(&install_path.join(&path), target)?;
+                    }
+                    continue;
+                }
+                let local_bytes = read_local_entry_content(install_path, local)?;
+                let target_bytes = target.content.as_deref().unwrap_or_default();
+                if can_merge_text(local, target) {
+                    if let Some(merged) = merge_text_conflict(
+                        &local_bytes,
+                        target_bytes,
+                        &format!(
+                            "gstack {}",
+                            target_version
+                                .map(ToOwned::to_owned)
+                                .unwrap_or_else(|| target_commit_sha.to_string())
+                        ),
+                    ) {
+                        merged_files.push(path.clone());
+                        if !dry_run {
+                            write_bytes_with_mode(
+                                &install_path.join(&path),
+                                &target.mode,
+                                &merged,
+                            )?;
+                        }
+                        continue;
+                    }
+                }
+                preserved_local_files.push(path.clone());
+                conflict_files.push(path.clone());
+                if !dry_run {
+                    if let Some(backup) = backup_path.as_ref() {
+                        let incoming = backup.join("incoming").join(format!("{path}.incoming"));
+                        write_bytes_with_mode(&incoming, &target.mode, target_bytes)?;
+                    }
+                }
+            }
+            (None, Some(_), None) | (None, None, None) => {}
+        }
+    }
+
+    if !dry_run && install_path.exists() {
+        prune_empty_dirs(install_path)?;
+    }
+
+    Ok(InstallApplyOutcome {
+        applied_files,
+        preserved_local_files,
+        merged_files,
+        conflict_files,
+        removed_files,
+        backup_path,
+    })
+}
+
 fn default_project_install_path(project: &crate::models::CatalogProject) -> PathBuf {
     let base = PathBuf::from(&project.canonical_path);
     if project.has_claude_dir || project.has_claude_md || project.has_claude_settings {
@@ -601,6 +822,52 @@ fn fallback_commit_ref(catalog: &Catalog) -> Result<(String, Option<String>)> {
     catalog
         .resolve_commit_ref(None, None)?
         .ok_or_else(|| anyhow!("no upstream commit is available in the catalog"))
+}
+
+pub fn global_default_statuses(
+    catalog: &Catalog,
+    hosts: &[HostKind],
+) -> Result<Vec<GlobalDefaultStatus>> {
+    let existing_paths = hosts
+        .iter()
+        .map(global_install_path)
+        .filter(|path| path.exists())
+        .collect::<Vec<_>>();
+    if !existing_paths.is_empty() {
+        let scan = scan_specific_paths(catalog, &existing_paths)?;
+        catalog.record_scan(&scan)?;
+    }
+
+    let installs = catalog.list_installs(false, None, None)?;
+    let mut statuses = Vec::new();
+    for host in hosts {
+        let install_path = global_install_path(host);
+        let install_path_string = install_path.to_string_lossy().to_string();
+        let canonical_install_path = real_path_or_original(&install_path);
+        let canonical_install_path_string = canonical_install_path.to_string_lossy().to_string();
+        let install = installs.iter().find(|install| {
+            install.host == host.clone()
+                && install.repository_path.is_none()
+                && (install.observed_path == install_path_string
+                    || install.observed_path == canonical_install_path_string
+                    || install.resolved_path == install_path_string
+                    || install.resolved_path == canonical_install_path_string)
+        });
+        statuses.push(GlobalDefaultStatus {
+            host: host.as_str().to_string(),
+            install_path: install_path_string.clone(),
+            installed: install.is_some() || install_path.exists(),
+            local_version: install.and_then(|record| record.local_version.clone()),
+            matched_upstream_version: install
+                .and_then(|record| record.matched_upstream_version.clone()),
+            matched_upstream_commit_sha: install
+                .and_then(|record| record.matched_upstream_commit_sha.clone()),
+            is_outdated: install.and_then(|record| record.is_outdated),
+            has_git: install.is_some_and(|record| record.has_git),
+            dirty: install.is_some_and(|record| record.dirty),
+        });
+    }
+    Ok(statuses)
 }
 
 pub fn project_diff_preview(
@@ -732,10 +999,6 @@ pub fn apply_version_to_projects(
         bail!("no upstream commit is available in the catalog");
     };
     let target_files = ensure_commit_files_available(catalog, &target_commit_sha)?;
-    let target_map = target_files
-        .iter()
-        .map(|file| (file.path.clone(), file.clone()))
-        .collect::<HashMap<_, _>>();
 
     let projects = resolve_projects(catalog, project_identifiers)?;
     let install_by_id = build_install_map(catalog)?;
@@ -756,155 +1019,15 @@ pub fn apply_version_to_projects(
         } else {
             HashMap::new()
         };
-        let local_entries = collect_local_manifest(&install_path)?;
-        let local_map = local_entries
-            .iter()
-            .map(|entry| (entry.path.clone(), entry.clone()))
-            .collect::<HashMap<_, _>>();
-        if !dry_run && !target_files.is_empty() {
-            ensure_dir(&install_path)?;
-        }
-
-        let mut all_paths = BTreeSet::new();
-        for path in base_files.keys() {
-            all_paths.insert(path.clone());
-        }
-        for path in target_map.keys() {
-            all_paths.insert(path.clone());
-        }
-        for path in local_map.keys() {
-            all_paths.insert(path.clone());
-        }
-
-        let mut applied_files = Vec::new();
-        let mut preserved_local_files = Vec::new();
-        let mut merged_files = Vec::new();
-        let mut conflict_files = Vec::new();
-        let mut removed_files = Vec::new();
-
-        let backup_path = if dry_run {
-            None
-        } else {
-            let backup = backup_root().join(format!("{}-project-{}", timestamp_slug(), project.id));
-            copy_manifest_to(&install_path, &local_entries, &backup)?;
-            Some(backup)
-        };
-
-        for path in all_paths {
-            let local = local_map.get(&path);
-            let base = base_files.get(&path);
-            let target = target_map.get(&path);
-            match (local, base, target) {
-                (None, _, Some(target)) => {
-                    applied_files.push(path.clone());
-                    if !dry_run {
-                        write_snapshot_file(&install_path.join(&path), target)?;
-                    }
-                }
-                (Some(local), Some(base), None) => {
-                    if local_matches_commit(local, base) {
-                        removed_files.push(path.clone());
-                        if !dry_run {
-                            remove_path_if_exists(&install_path.join(&path))?;
-                        }
-                    } else {
-                        preserved_local_files.push(path.clone());
-                    }
-                }
-                (Some(_local), None, None) => {
-                    preserved_local_files.push(path.clone());
-                }
-                (Some(local), Some(base), Some(target)) => {
-                    if local_matches_commit(local, target) {
-                        continue;
-                    }
-                    if local_matches_commit(local, base) {
-                        applied_files.push(path.clone());
-                        if !dry_run {
-                            write_snapshot_file(&install_path.join(&path), target)?;
-                        }
-                    } else if base.blob_sha == target.blob_sha && base.mode == target.mode {
-                        preserved_local_files.push(path.clone());
-                    } else {
-                        let local_bytes = read_local_entry_content(&install_path, local)?;
-                        let target_bytes = target.content.as_deref().unwrap_or_default();
-                        if can_merge_text(local, target) {
-                            if let Some(merged) = merge_text_conflict(
-                                &local_bytes,
-                                target_bytes,
-                                &format!(
-                                    "gstack {}",
-                                    target_version
-                                        .clone()
-                                        .unwrap_or_else(|| target_commit_sha.clone())
-                                ),
-                            ) {
-                                merged_files.push(path.clone());
-                                if !dry_run {
-                                    write_bytes_with_mode(
-                                        &install_path.join(&path),
-                                        &target.mode,
-                                        &merged,
-                                    )?;
-                                }
-                                continue;
-                            }
-                        }
-                        preserved_local_files.push(path.clone());
-                        conflict_files.push(path.clone());
-                        if !dry_run {
-                            if let Some(backup) = backup_path.as_ref() {
-                                let incoming =
-                                    backup.join("incoming").join(format!("{path}.incoming"));
-                                write_bytes_with_mode(&incoming, &target.mode, target_bytes)?;
-                            }
-                        }
-                    }
-                }
-                (Some(local), None, Some(target)) => {
-                    if local_matches_commit(local, target) {
-                        continue;
-                    }
-                    let local_bytes = read_local_entry_content(&install_path, local)?;
-                    let target_bytes = target.content.as_deref().unwrap_or_default();
-                    if can_merge_text(local, target) {
-                        if let Some(merged) = merge_text_conflict(
-                            &local_bytes,
-                            target_bytes,
-                            &format!(
-                                "gstack {}",
-                                target_version
-                                    .clone()
-                                    .unwrap_or_else(|| target_commit_sha.clone())
-                            ),
-                        ) {
-                            merged_files.push(path.clone());
-                            if !dry_run {
-                                write_bytes_with_mode(
-                                    &install_path.join(&path),
-                                    &target.mode,
-                                    &merged,
-                                )?;
-                            }
-                            continue;
-                        }
-                    }
-                    preserved_local_files.push(path.clone());
-                    conflict_files.push(path.clone());
-                    if !dry_run {
-                        if let Some(backup) = backup_path.as_ref() {
-                            let incoming = backup.join("incoming").join(format!("{path}.incoming"));
-                            write_bytes_with_mode(&incoming, &target.mode, target_bytes)?;
-                        }
-                    }
-                }
-                (None, Some(_), None) | (None, None, None) => {}
-            }
-        }
-
-        if !dry_run && install_path.exists() {
-            prune_empty_dirs(&install_path)?;
-        }
+        let outcome = apply_install_contents(
+            &install_path,
+            &base_files,
+            &target_files,
+            &target_commit_sha,
+            target_version.as_deref(),
+            dry_run,
+            &format!("project-{}", project.id),
+        )?;
 
         results.push(ApplyResult {
             project: project.clone(),
@@ -912,12 +1035,14 @@ pub fn apply_version_to_projects(
             commit_sha: target_commit_sha.clone(),
             version: target_version.clone(),
             dry_run,
-            applied_files,
-            preserved_local_files,
-            merged_files,
-            conflict_files,
-            removed_files,
-            backup_path: backup_path.map(|path| path.to_string_lossy().to_string()),
+            applied_files: outcome.applied_files,
+            preserved_local_files: outcome.preserved_local_files,
+            merged_files: outcome.merged_files,
+            conflict_files: outcome.conflict_files,
+            removed_files: outcome.removed_files,
+            backup_path: outcome
+                .backup_path
+                .map(|path| path.to_string_lossy().to_string()),
             status: if dry_run {
                 "dry_run".to_string()
             } else {
@@ -970,6 +1095,135 @@ pub fn apply_version_to_projects(
             &json!({
                 "project_id": result.project.id,
                 "project_path": result.project.canonical_path,
+                "install_path": result.install_path,
+                "applied_files": result.applied_files,
+                "preserved_local_files": result.preserved_local_files,
+                "merged_files": result.merged_files,
+                "conflict_files": result.conflict_files,
+                "removed_files": result.removed_files,
+            }),
+        )?;
+    }
+
+    Ok(results)
+}
+
+pub fn set_global_default_version(
+    catalog: &Catalog,
+    hosts: &[HostKind],
+    version: Option<&str>,
+    commit_sha: Option<&str>,
+    dry_run: bool,
+) -> Result<Vec<GlobalDefaultApplyResult>> {
+    let Some((target_commit_sha, target_version)) =
+        catalog.resolve_commit_ref(commit_sha, version)?
+    else {
+        bail!("no upstream commit is available in the catalog");
+    };
+    let target_files = ensure_commit_files_available(catalog, &target_commit_sha)?;
+    let installs = catalog.list_installs(false, None, None)?;
+    let mut install_id_by_path = installs
+        .iter()
+        .map(|install| (install.observed_path.clone(), install.id))
+        .collect::<HashMap<_, _>>();
+    let mut results = Vec::new();
+    ensure_dir(&backup_root())?;
+
+    for host in hosts {
+        let install_path = global_install_path(host);
+        let install_path_string = install_path.to_string_lossy().to_string();
+        let current_install = installs.iter().find(|install| {
+            install.host == host.clone() && install_matches_path(install, &install_path)
+        });
+        let base_files = if let Some(base_sha) =
+            current_install.and_then(|install| install.matched_upstream_commit_sha.clone())
+        {
+            ensure_commit_files_available(catalog, &base_sha)?
+                .into_iter()
+                .map(|file| (file.path.clone(), file))
+                .collect::<HashMap<_, _>>()
+        } else {
+            HashMap::new()
+        };
+        let outcome = apply_install_contents(
+            &install_path,
+            &base_files,
+            &target_files,
+            &target_commit_sha,
+            target_version.as_deref(),
+            dry_run,
+            &format!("global-{}", host.as_str()),
+        )?;
+        results.push(GlobalDefaultApplyResult {
+            host: host.as_str().to_string(),
+            install_path: install_path_string,
+            commit_sha: target_commit_sha.clone(),
+            version: target_version.clone(),
+            dry_run,
+            applied_files: outcome.applied_files,
+            preserved_local_files: outcome.preserved_local_files,
+            merged_files: outcome.merged_files,
+            conflict_files: outcome.conflict_files,
+            removed_files: outcome.removed_files,
+            backup_path: outcome
+                .backup_path
+                .map(|path| path.to_string_lossy().to_string()),
+            status: if dry_run {
+                "dry_run".to_string()
+            } else {
+                "applied".to_string()
+            },
+        });
+    }
+
+    if !dry_run && !results.is_empty() {
+        let scan_paths = results
+            .iter()
+            .map(|result| PathBuf::from(&result.install_path))
+            .collect::<Vec<_>>();
+        let scan = scan_specific_paths(catalog, &scan_paths)?;
+        catalog.record_scan(&scan)?;
+        install_id_by_path.extend(
+            catalog
+                .list_installs(false, None, None)?
+                .into_iter()
+                .map(|install| (install.observed_path.clone(), install.id)),
+        );
+    }
+
+    for result in &results {
+        let resolved_result_path = real_path_or_original(Path::new(&result.install_path))
+            .to_string_lossy()
+            .to_string();
+        let install_id = install_id_by_path
+            .get(&result.install_path)
+            .copied()
+            .or_else(|| install_id_by_path.get(&resolved_result_path).copied());
+        let Some(install_id) = install_id else {
+            continue;
+        };
+        let changed_files = result
+            .applied_files
+            .iter()
+            .chain(&result.preserved_local_files)
+            .chain(&result.merged_files)
+            .chain(&result.conflict_files)
+            .chain(&result.removed_files)
+            .cloned()
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect::<Vec<_>>();
+        catalog.record_sync_event(
+            install_id,
+            &result.commit_sha,
+            result.version.as_deref(),
+            result.dry_run,
+            &changed_files,
+            result.backup_path.as_deref(),
+            &result.status,
+            &json!({
+                "scope": "global_default",
+                "host": result.host,
                 "install_path": result.install_path,
                 "applied_files": result.applied_files,
                 "preserved_local_files": result.preserved_local_files,

@@ -94,8 +94,12 @@ fn ingest_scan_and_upgrade_work_end_to_end() -> Result<()> {
     let scan = scan_local_installs(&catalog, std::slice::from_ref(&project_repo), Some(4))?;
     catalog.record_scan(&scan)?;
     let installs = catalog.list_installs(false, None, None)?;
-    assert_eq!(installs.len(), 1);
-    assert_eq!(installs[0].is_outdated, Some(true));
+    let canonical_install_dir = fs::canonicalize(&install_dir)?;
+    let fixture_install = installs
+        .iter()
+        .find(|install| install.observed_path == canonical_install_dir.to_string_lossy())
+        .expect("fixture install should be present in the catalog");
+    assert_eq!(fixture_install.is_outdated, Some(true));
 
     let ideas = build_ideas(&installs, &catalog.summary()?.source);
     assert!(
@@ -104,7 +108,15 @@ fn ingest_scan_and_upgrade_work_end_to_end() -> Result<()> {
             .any(|idea| idea.title.contains("older local gstack copy"))
     );
 
-    let dry_run = materialize_targets(&catalog, None, None, &[], true, true, false)?;
+    let dry_run = materialize_targets(
+        &catalog,
+        None,
+        None,
+        &[canonical_install_dir.to_string_lossy().to_string()],
+        false,
+        true,
+        false,
+    )?;
     assert_eq!(dry_run.len(), 1);
     assert!(
         dry_run[0]
@@ -114,7 +126,15 @@ fn ingest_scan_and_upgrade_work_end_to_end() -> Result<()> {
             .any(|path| path == "VERSION")
     );
 
-    let applied = materialize_targets(&catalog, None, None, &[], true, false, false)?;
+    let applied = materialize_targets(
+        &catalog,
+        None,
+        None,
+        &[canonical_install_dir.to_string_lossy().to_string()],
+        false,
+        false,
+        false,
+    )?;
     assert_eq!(applied.len(), 1);
     assert_eq!(
         fs::read_to_string(install_dir.join("VERSION"))?.trim(),
@@ -354,6 +374,81 @@ fn diff_preview_and_targeted_revert_work_end_to_end() -> Result<()> {
 }
 
 #[test]
+fn version_metadata_files_are_overwritten_not_conflict_merged() -> Result<()> {
+    let workspace = temp_dir("gstackqlite-hypervisor-version-metadata-test");
+    let upstream_repo = workspace.join("upstream");
+    let project_repo = workspace.join("project");
+    let install_dir = project_repo.join(".claude").join("skills").join("gstack");
+    let db_path = workspace.join("catalog.sqlite");
+
+    init_fixture_repo(&upstream_repo)?;
+    let catalog = Catalog::new(&db_path)?;
+    ingest_upstream(
+        &catalog,
+        Some(upstream_repo.to_str().unwrap()),
+        Some("HEAD"),
+    )?;
+
+    fs::create_dir_all(&project_repo)?;
+    run(&project_repo, &["init"])?;
+    configure_test_repo(&project_repo)?;
+    fs::write(
+        project_repo.join("CLAUDE.md"),
+        "## gstack\nUse local skills.\n",
+    )?;
+
+    fs::create_dir_all(install_dir.join("docs"))?;
+    fs::create_dir_all(install_dir.join("browse").join("dist"))?;
+    fs::write(install_dir.join("VERSION"), "0.0.1.0\n")?;
+    fs::write(
+        install_dir.join("browse").join("dist").join(".version"),
+        "oldcommit\n",
+    )?;
+    fs::write(install_dir.join("README.md"), "# fixture v1\n")?;
+    fs::write(install_dir.join("docs").join("note.md"), "first\n")?;
+
+    let initial_scan = scan_local_installs(&catalog, std::slice::from_ref(&project_repo), Some(4))?;
+    catalog.record_scan(&initial_scan)?;
+
+    fs::write(
+        install_dir.join("VERSION"),
+        "<<<<<<< local customization\n0.0.1.1\n=======\n0.0.2.0\n>>>>>>> gstack 0.0.2.0\n",
+    )?;
+    fs::write(
+        install_dir.join("browse").join("dist").join(".version"),
+        "<<<<<<< local customization\noldcommit\n=======\nnewcommit\n>>>>>>> gstack 0.0.2.0\n",
+    )?;
+
+    let modified_scan =
+        scan_local_installs(&catalog, std::slice::from_ref(&project_repo), Some(4))?;
+    catalog.record_scan(&modified_scan)?;
+
+    let project = catalog
+        .list_projects()?
+        .into_iter()
+        .next()
+        .expect("project should be cataloged");
+
+    let applied = apply_version_to_projects(
+        &catalog,
+        Some("0.0.2.0"),
+        None,
+        &[project.id.to_string()],
+        false,
+    )?;
+    let result = &applied[0];
+    assert!(result.applied_files.iter().any(|path| path == "VERSION"));
+    assert!(!result.merged_files.iter().any(|path| path == "VERSION"));
+    assert!(!result.conflict_files.iter().any(|path| path == "VERSION"));
+    assert_eq!(
+        fs::read_to_string(install_dir.join("VERSION"))?.trim(),
+        "0.0.2.0"
+    );
+
+    Ok(())
+}
+
+#[test]
 fn codex_project_markers_are_detected() -> Result<()> {
     let workspace = temp_dir("gstackqlite-hypervisor-codex-project-test");
     let upstream_repo = workspace.join("upstream");
@@ -412,8 +507,12 @@ fn codex_project_markers_are_detected() -> Result<()> {
     );
 
     let installs = catalog.list_installs(false, None, None)?;
-    assert_eq!(installs.len(), 1);
-    assert_eq!(installs[0].host.as_str(), "codex");
+    let canonical_install_dir = fs::canonicalize(&install_dir)?;
+    let fixture_install = installs
+        .iter()
+        .find(|install| install.observed_path == canonical_install_dir.to_string_lossy())
+        .expect("fixture codex install should be present in the catalog");
+    assert_eq!(fixture_install.host.as_str(), "codex");
 
     Ok(())
 }

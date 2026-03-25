@@ -388,6 +388,35 @@ pub struct ApplyResult {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GlobalDefaultStatus {
+    pub host: String,
+    pub install_path: String,
+    pub installed: bool,
+    pub local_version: Option<String>,
+    pub matched_upstream_version: Option<String>,
+    pub matched_upstream_commit_sha: Option<String>,
+    pub is_outdated: Option<bool>,
+    pub has_git: bool,
+    pub dirty: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GlobalDefaultApplyResult {
+    pub host: String,
+    pub install_path: String,
+    pub commit_sha: String,
+    pub version: Option<String>,
+    pub dry_run: bool,
+    pub applied_files: Vec<String>,
+    pub preserved_local_files: Vec<String>,
+    pub merged_files: Vec<String>,
+    pub conflict_files: Vec<String>,
+    pub removed_files: Vec<String>,
+    pub backup_path: Option<String>,
+    pub status: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RemoveResult {
     pub project: CatalogProject,
     pub install_path: String,

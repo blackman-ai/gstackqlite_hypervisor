@@ -5,7 +5,8 @@ use std::path::{Path, PathBuf};
 use anyhow::Result;
 
 use crate::config::{
-    DEFAULT_MAX_DEPTH, LOCAL_INSTALL_RELATIVE_PATHS, REPO_SCAN_SKIP_DIRS, known_install_locations,
+    DEFAULT_MAX_DEPTH, LOCAL_INSTALL_RELATIVE_PATHS, REPO_SCAN_SKIP_DIRS, home_dir,
+    known_install_locations,
 };
 use crate::db::Catalog;
 use crate::git;
@@ -52,8 +53,14 @@ fn unique_existing_paths(paths: &[PathBuf]) -> Vec<PathBuf> {
 }
 
 fn has_project_markers(path: &Path) -> bool {
-    path.join("CLAUDE.md").exists()
-        || path.join("AGENTS.md").exists()
+    let has_claude_md = path.join("CLAUDE.md").exists();
+    let has_agents_md = path.join("AGENTS.md").exists();
+    if real_path_or_original(path) == real_path_or_original(&home_dir()) {
+        return has_claude_md || has_agents_md;
+    }
+
+    has_claude_md
+        || has_agents_md
         || path.join(".claude").exists()
         || path.join(".codex").exists()
         || path.join(".agents").exists()
@@ -118,6 +125,15 @@ fn inspect_repo(path: &Path) -> DiscoveredRepo {
 }
 
 fn infer_project_root(install_path: &Path) -> Option<PathBuf> {
+    let canonical_install = real_path_or_original(install_path);
+    if known_install_locations()
+        .into_iter()
+        .map(|path| real_path_or_original(&path))
+        .any(|path| path == canonical_install)
+    {
+        return None;
+    }
+
     let normalized = install_path.to_string_lossy().replace('\\', "/");
     for suffix in LOCAL_INSTALL_RELATIVE_PATHS {
         let needle = format!("/{suffix}");
@@ -134,8 +150,6 @@ fn infer_project_root(install_path: &Path) -> Option<PathBuf> {
 fn discover_project(
     project_path: &Path,
     installs: &[DiscoveredInstall],
-    global_claude_install: Option<&DiscoveredInstall>,
-    global_codex_install: Option<&DiscoveredInstall>,
 ) -> Option<DiscoveredProject> {
     let has_git_repo = project_path.join(".git").exists();
     let claude_md = project_path.join("CLAUDE.md");
@@ -203,12 +217,6 @@ fn discover_project(
                 local_install.local_version.clone(),
                 "local_install".to_string(),
                 Some(local_install.observed_path.clone()),
-            )
-        } else if let Some(global_install) = global_claude_install.or(global_codex_install) {
-            (
-                global_install.local_version.clone(),
-                "global_install".to_string(),
-                None,
             )
         } else {
             (None, "none".to_string(), None)
@@ -359,22 +367,9 @@ pub fn scan_local_installs(
         let repository_path = infer_project_root(&path);
         installs.push(inspect_install(catalog, &path, repository_path.as_deref())?);
     }
-    let global_claude_install = installs.iter().find(|install| {
-        install.repository_path.is_none() && matches!(install.host, HostKind::Claude)
-    });
-    let global_codex_install = installs.iter().find(|install| {
-        install.repository_path.is_none() && matches!(install.host, HostKind::Codex)
-    });
     let projects = project_roots
         .iter()
-        .filter_map(|project| {
-            discover_project(
-                project,
-                &installs,
-                global_claude_install,
-                global_codex_install,
-            )
-        })
+        .filter_map(|project| discover_project(project, &installs))
         .collect::<Vec<_>>();
 
     let source = catalog.source_state()?;
@@ -413,22 +408,9 @@ pub fn scan_specific_paths(catalog: &Catalog, install_paths: &[PathBuf]) -> Resu
         }
         installs.push(inspect_install(catalog, &path, repository_path.as_deref())?);
     }
-    let global_claude_install = installs.iter().find(|install| {
-        install.repository_path.is_none() && matches!(install.host, HostKind::Claude)
-    });
-    let global_codex_install = installs.iter().find(|install| {
-        install.repository_path.is_none() && matches!(install.host, HostKind::Codex)
-    });
     let projects = project_roots
         .iter()
-        .filter_map(|project| {
-            discover_project(
-                Path::new(project),
-                &installs,
-                global_claude_install,
-                global_codex_install,
-            )
-        })
+        .filter_map(|project| discover_project(Path::new(project), &installs))
         .collect::<Vec<_>>();
     let source = catalog.source_state()?;
     Ok(ScanResult {

@@ -6,6 +6,7 @@ DEFAULT_INSTALL_DIR="${HOME}/.local/bin"
 INSTALL_DIR="${GSTACKQLITE_HYPERVISOR_INSTALL_DIR:-${GSTACK_HYPERVISOR_INSTALL_DIR:-${DEFAULT_INSTALL_DIR}}}"
 VERSION="${GSTACKQLITE_HYPERVISOR_VERSION:-${GSTACK_HYPERVISOR_VERSION:-latest}}"
 REPOSITORY="${GSTACKQLITE_HYPERVISOR_REPO:-${GSTACK_HYPERVISOR_REPO:-blackman-ai/gstackqlite_hypervisor}}"
+AGENT_INSTALL="${GSTACKQLITE_HYPERVISOR_AGENT_INSTALL:-${GSTACK_HYPERVISOR_AGENT_INSTALL:-prompt}}"
 UPDATE_PATH=1
 SCRIPT_SOURCE="${BASH_SOURCE[0]-}"
 SCRIPT_DIR=""
@@ -21,17 +22,19 @@ Install gstackqlite-hypervisor from a GitHub release.
 If the script is next to a packaged binary, it installs that local copy instead.
 
 Usage:
-  install.sh [--repo owner/repo] [--version v0.0.1|latest] [--install-dir /path] [--no-path-update]
+  install.sh [--repo owner/repo] [--version v0.0.4|latest] [--install-dir /path] [--no-path-update]
 
 Environment:
   GSTACKQLITE_HYPERVISOR_REPO         GitHub repository slug, for example "owner/gstackqlite_hypervisor"
   GSTACKQLITE_HYPERVISOR_VERSION      Release tag to install, defaults to "latest"
   GSTACKQLITE_HYPERVISOR_INSTALL_DIR  Install directory, defaults to "$HOME/.local/bin"
+  GSTACKQLITE_HYPERVISOR_AGENT_INSTALL Agent bootstrap choice: "claude", "codex", "both", "none", or "prompt"
 
 Compatibility aliases:
   GSTACK_HYPERVISOR_REPO
   GSTACK_HYPERVISOR_VERSION
   GSTACK_HYPERVISOR_INSTALL_DIR
+  GSTACK_HYPERVISOR_AGENT_INSTALL
 EOF
 }
 
@@ -70,6 +73,10 @@ need_cmd() {
     echo "Missing required command: $1" >&2
     exit 1
   fi
+}
+
+command_exists() {
+  command -v "$1" >/dev/null 2>&1
 }
 
 need_cmd uname
@@ -215,6 +222,111 @@ maybe_update_path() {
   esac
 }
 
+ensure_bun_in_path() {
+  export BUN_INSTALL="${BUN_INSTALL:-${HOME}/.bun}"
+  case ":${PATH}:" in
+    *":${BUN_INSTALL}/bin:"*) ;;
+    *) export PATH="${BUN_INSTALL}/bin:${PATH}" ;;
+  esac
+}
+
+install_bun_if_needed() {
+  if command_exists bun; then
+    return
+  fi
+
+  echo "Bun was not found. Installing Bun..."
+  fetch_text "https://bun.com/install" | bash
+  ensure_bun_in_path
+
+  if ! command_exists bun; then
+    echo "Bun install completed, but 'bun' is still not available on PATH." >&2
+    echo "Try opening a new shell and rerunning the installer." >&2
+    exit 1
+  fi
+}
+
+resolve_agent_selection() {
+  local normalized
+  normalized="$(printf '%s' "${AGENT_INSTALL}" | tr '[:upper:]' '[:lower:]' | tr -d '[:space:]')"
+  case "${normalized}" in
+    claude|codex|both|none)
+      printf '%s\n' "${normalized}"
+      return
+      ;;
+    ""|prompt)
+      ;;
+    *)
+      echo "Unsupported GSTACKQLITE_HYPERVISOR_AGENT_INSTALL value: ${AGENT_INSTALL}" >&2
+      exit 1
+      ;;
+  esac
+
+  if [[ ! -t 0 ]]; then
+    echo "Skipping Claude/Codex bootstrap because stdin is not interactive." >&2
+    echo "Set GSTACKQLITE_HYPERVISOR_AGENT_INSTALL=claude|codex|both|none to override." >&2
+    printf 'none\n'
+    return
+  fi
+
+  while true; do
+    printf 'Neither Claude nor Codex is installed. Install which agent(s)? [claude/codex/both/none] '
+    read -r normalized
+    normalized="$(printf '%s' "${normalized}" | tr '[:upper:]' '[:lower:]' | tr -d '[:space:]')"
+    case "${normalized}" in
+      claude|codex|both|none)
+        printf '%s\n' "${normalized}"
+        return
+        ;;
+    esac
+    echo "Enter one of: claude, codex, both, none." >&2
+  done
+}
+
+install_claude_if_needed() {
+  if command_exists claude; then
+    return
+  fi
+  ensure_bun_in_path
+  echo "Installing Claude Code with Bun..."
+  bun install --global @anthropic-ai/claude-code
+}
+
+install_codex_if_needed() {
+  if command_exists codex; then
+    return
+  fi
+  ensure_bun_in_path
+  echo "Installing Codex CLI with Bun..."
+  bun install --global @openai/codex
+}
+
+maybe_install_agents() {
+  local has_claude=0 has_codex=0 selection
+  command_exists claude && has_claude=1
+  command_exists codex && has_codex=1
+  if [[ "${has_claude}" -eq 1 || "${has_codex}" -eq 1 ]]; then
+    return
+  fi
+
+  selection="$(resolve_agent_selection)"
+  case "${selection}" in
+    claude)
+      install_claude_if_needed
+      ;;
+    codex)
+      install_codex_if_needed
+      ;;
+    both)
+      install_claude_if_needed
+      install_codex_if_needed
+      ;;
+    none)
+      echo "Skipping Claude/Codex bootstrap."
+      ;;
+  esac
+}
+
 resolved_version="$(resolve_version)"
 target="$(detect_target)"
 archive_name="${BINARY_NAME}-${resolved_version#v}-${target}.tar.gz"
@@ -228,6 +340,8 @@ install_binary() {
   cp "${source_path}" "${INSTALL_DIR}/${BINARY_NAME}"
   chmod +x "${INSTALL_DIR}/${BINARY_NAME}"
   maybe_update_path
+  install_bun_if_needed
+  maybe_install_agents
   echo "Installed ${BINARY_NAME} to ${INSTALL_DIR}/${BINARY_NAME}"
   echo "Run '${BINARY_NAME} --help' after opening a new shell, or export PATH=\"${INSTALL_DIR}:\$PATH\" now."
 }

@@ -16,15 +16,22 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph, Wrap};
 
-use crate::config::{DEFAULT_MAX_DEPTH, default_scan_roots};
+use crate::bootstrap::{
+    AgentInstallChoice, RuntimeStatus, detect_runtime_status, ensure_bun_installed, install_agents,
+};
+use crate::config::{DEFAULT_MAX_DEPTH, default_scan_roots, home_dir};
 use crate::db::Catalog;
 use crate::lofi::{LofiPlayer, TrackKind};
 use crate::models::{
     CatalogCommitNote, CatalogInstall, CatalogProject, CatalogSummary, CatalogSyncEvent,
-    CatalogVersion, CatalogVersionContext, DiffPreviewFile, ProjectDiffPreview,
+    CatalogVersion, CatalogVersionContext, DiffPreviewFile, GlobalDefaultStatus, HostKind,
+    ProjectDiffPreview,
 };
 use crate::scan::sync_catalog;
-use crate::upgrade::{apply_version_to_projects, project_diff_preview, revert_projects};
+use crate::upgrade::{
+    apply_version_to_projects, global_default_statuses, project_diff_preview, revert_projects,
+    set_global_default_version,
+};
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Focus {
@@ -45,6 +52,51 @@ impl Focus {
 enum InputMode {
     Normal,
     Filtering(Focus),
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SystemTarget {
+    Claude,
+    Codex,
+    Both,
+}
+
+impl SystemTarget {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Claude => "Claude",
+            Self::Codex => "Codex",
+            Self::Both => "Both",
+        }
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum BootstrapTarget {
+    None,
+    Claude,
+    Codex,
+    Both,
+}
+
+impl BootstrapTarget {
+    fn label(self) -> &'static str {
+        match self {
+            Self::None => "none",
+            Self::Claude => "claude",
+            Self::Codex => "codex",
+            Self::Both => "both",
+        }
+    }
+
+    fn as_choice(self) -> AgentInstallChoice {
+        match self {
+            Self::None => AgentInstallChoice::None,
+            Self::Claude => AgentInstallChoice::Claude,
+            Self::Codex => AgentInstallChoice::Codex,
+            Self::Both => AgentInstallChoice::Both,
+        }
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -136,6 +188,11 @@ struct App {
     selected_backup: usize,
     diff_preview_pending: bool,
     diff_preview_requested_at: Option<Instant>,
+    system_defaults: Vec<GlobalDefaultStatus>,
+    runtime_status: RuntimeStatus,
+    system_target: SystemTarget,
+    bootstrap_target: BootstrapTarget,
+    bootstrap_log: Vec<String>,
     focus: Focus,
     input_mode: InputMode,
     project_filter: String,
@@ -144,6 +201,8 @@ struct App {
     track_index: usize,
     music_enabled: bool,
     show_help: bool,
+    show_system: bool,
+    show_bootstrap: bool,
     lofi: Option<LofiPlayer>,
     music_started_at: Option<Instant>,
     status: String,
@@ -174,6 +233,11 @@ impl App {
             selected_backup: 0,
             diff_preview_pending: false,
             diff_preview_requested_at: None,
+            system_defaults: Vec::new(),
+            runtime_status: RuntimeStatus::default(),
+            system_target: SystemTarget::Both,
+            bootstrap_target: BootstrapTarget::Both,
+            bootstrap_log: Vec::new(),
             focus: Focus::Projects,
             input_mode: InputMode::Normal,
             project_filter: String::new(),
@@ -182,6 +246,8 @@ impl App {
             track_index: 0,
             music_enabled: true,
             show_help: false,
+            show_system: false,
+            show_bootstrap: false,
             lofi: None,
             music_started_at: None,
             status: "starting catalog bootstrap".to_string(),
@@ -189,7 +255,9 @@ impl App {
         app.restore_ui_preferences()?;
         app.refresh()?;
         app.sync_on_boot();
+        let _ = app.refresh_system_state();
         app.start_lofi_default();
+        app.bootstrap_on_boot();
         Ok(app)
     }
 
@@ -239,6 +307,151 @@ impl App {
         ) {
             self.status = format!("failed to save music preference: {error}");
         }
+    }
+
+    fn selected_system_hosts(&self) -> Vec<HostKind> {
+        match self.system_target {
+            SystemTarget::Claude => vec![HostKind::Claude],
+            SystemTarget::Codex => vec![HostKind::Codex],
+            SystemTarget::Both => vec![HostKind::Claude, HostKind::Codex],
+        }
+    }
+
+    fn refresh_system_state(&mut self) -> Result<()> {
+        self.runtime_status = detect_runtime_status();
+        self.system_defaults =
+            global_default_statuses(&self.catalog, &[HostKind::Claude, HostKind::Codex])?;
+        Ok(())
+    }
+
+    fn bootstrap_on_boot(&mut self) {
+        if !self.runtime_status.bun.installed {
+            match ensure_bun_installed() {
+                Ok(lines) => {
+                    self.bootstrap_log = lines;
+                    self.status = "installed Bun automatically for TUI bootstrap".to_string();
+                }
+                Err(error) => {
+                    self.bootstrap_log = vec![format!("Automatic Bun install failed: {error}")];
+                    self.show_bootstrap = true;
+                    self.status = "automatic Bun install failed; open bootstrap modal".to_string();
+                    return;
+                }
+            }
+            let _ = self.refresh_system_state();
+        }
+
+        if !self.runtime_status.claude.installed && !self.runtime_status.codex.installed {
+            self.show_bootstrap = true;
+            self.show_help = false;
+            self.show_system = false;
+            self.status =
+                "neither Claude nor Codex is installed; choose one in the bootstrap modal"
+                    .to_string();
+        }
+    }
+
+    fn toggle_system(&mut self) {
+        self.show_system = !self.show_system;
+        if self.show_system {
+            self.show_help = false;
+            if let Err(error) = self.refresh_system_state() {
+                self.status = format!("failed to refresh system status: {error}");
+                return;
+            }
+            self.status = format!(
+                "system modal open: target={} selected_version={}",
+                self.system_target.label(),
+                self.selected_version()
+                    .map(|version| version.version.clone())
+                    .unwrap_or_else(|| "head".to_string())
+            );
+        } else {
+            self.status = "system modal closed".to_string();
+        }
+    }
+
+    fn cycle_system_target(&mut self) {
+        self.system_target = match self.system_target {
+            SystemTarget::Claude => SystemTarget::Codex,
+            SystemTarget::Codex => SystemTarget::Both,
+            SystemTarget::Both => SystemTarget::Claude,
+        };
+        self.status = format!("system target: {}", self.system_target.label());
+    }
+
+    fn set_system_target(&mut self, target: SystemTarget) {
+        self.system_target = target;
+        self.status = format!("system target: {}", self.system_target.label());
+    }
+
+    fn cycle_bootstrap_target(&mut self) {
+        self.bootstrap_target = match self.bootstrap_target {
+            BootstrapTarget::None => BootstrapTarget::Claude,
+            BootstrapTarget::Claude => BootstrapTarget::Codex,
+            BootstrapTarget::Codex => BootstrapTarget::Both,
+            BootstrapTarget::Both => BootstrapTarget::None,
+        };
+        self.status = format!("bootstrap selection: {}", self.bootstrap_target.label());
+    }
+
+    fn set_bootstrap_target(&mut self, target: BootstrapTarget) {
+        self.bootstrap_target = target;
+        self.status = format!("bootstrap selection: {}", self.bootstrap_target.label());
+    }
+
+    fn dismiss_bootstrap(&mut self) {
+        self.show_bootstrap = false;
+        self.status = "bootstrap modal dismissed".to_string();
+    }
+
+    fn run_bootstrap_install(&mut self) {
+        let mut log = Vec::new();
+        if !self.runtime_status.bun.installed {
+            match ensure_bun_installed() {
+                Ok(mut lines) => log.append(&mut lines),
+                Err(error) => {
+                    self.bootstrap_log = vec![format!("Bun install failed: {error}")];
+                    self.status = "bootstrap failed while installing Bun".to_string();
+                    let _ = self.refresh_system_state();
+                    self.show_bootstrap = true;
+                    return;
+                }
+            }
+        }
+
+        if !self.runtime_status.claude.installed && !self.runtime_status.codex.installed {
+            match install_agents(self.bootstrap_target.as_choice()) {
+                Ok(mut lines) => log.append(&mut lines),
+                Err(error) => {
+                    log.push(format!("Agent install failed: {error}"));
+                    self.bootstrap_log = log;
+                    self.status = "bootstrap failed while installing agents".to_string();
+                    let _ = self.refresh_system_state();
+                    self.show_bootstrap = true;
+                    return;
+                }
+            }
+        } else {
+            log.push(
+                "At least one agent is already installed; agent bootstrap skipped.".to_string(),
+            );
+        }
+
+        self.bootstrap_log = log;
+        if let Err(error) = self.refresh_system_state() {
+            self.status = format!("bootstrap succeeded but system refresh failed: {error}");
+            self.show_bootstrap = true;
+            return;
+        }
+
+        self.show_bootstrap = false;
+        self.status = format!(
+            "bootstrap complete: bun={} claude={} codex={}",
+            self.runtime_status.bun.installed,
+            self.runtime_status.claude.installed,
+            self.runtime_status.codex.installed
+        );
     }
 
     fn current_filter(&self, focus: Focus) -> &str {
@@ -562,6 +775,56 @@ impl App {
         let _ = self.refresh();
     }
 
+    fn apply_system_selected(&mut self, dry_run: bool) {
+        let selected_version = self
+            .selected_version()
+            .map(|version| version.version.clone());
+        match set_global_default_version(
+            &self.catalog,
+            &self.selected_system_hosts(),
+            selected_version.as_deref(),
+            None,
+            dry_run,
+        ) {
+            Ok(results) => {
+                if results.is_empty() {
+                    self.status = "no global default targets were updated".to_string();
+                } else {
+                    let changed = results
+                        .iter()
+                        .map(|result| result.host.clone())
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    let applied = results
+                        .iter()
+                        .map(|result| result.applied_files.len())
+                        .sum::<usize>();
+                    let merged = results
+                        .iter()
+                        .map(|result| result.merged_files.len())
+                        .sum::<usize>();
+                    let conflicts = results
+                        .iter()
+                        .map(|result| result.conflict_files.len())
+                        .sum::<usize>();
+                    self.status = format!(
+                        "{} system default for {} applied={} merged={} conflicts={}",
+                        if dry_run { "dry-run" } else { "applied" },
+                        changed,
+                        applied,
+                        merged,
+                        conflicts
+                    );
+                }
+            }
+            Err(error) => {
+                self.status = format!("system default apply failed: {error}");
+            }
+        }
+        let _ = self.refresh();
+        let _ = self.refresh_system_state();
+    }
+
     fn revert_selected(&mut self, dry_run: bool) {
         let Some(project) = self.selected_project().cloned() else {
             self.status = "no project selected".to_string();
@@ -598,6 +861,9 @@ impl App {
 
     fn toggle_help(&mut self) {
         self.show_help = !self.show_help;
+        if self.show_help {
+            self.show_system = false;
+        }
         self.status = if self.show_help {
             "help open: press h, ?, enter, or esc to close".to_string()
         } else {
@@ -909,6 +1175,7 @@ fn project_current_gstack_line(project: &CatalogProject) -> String {
             project
                 .gstack_install_observed_path
                 .clone()
+                .map(|path| display_path(&path))
                 .unwrap_or_else(|| "-".to_string())
         ),
         "global_install" => format!(
@@ -936,6 +1203,7 @@ fn project_current_gstack_line(project: &CatalogProject) -> String {
             project
                 .gstack_install_observed_path
                 .clone()
+                .map(|path| display_path(&path))
                 .unwrap_or_else(|| "-".to_string())
         ),
     }
@@ -1062,6 +1330,33 @@ fn display_filter(filter: &str) -> String {
     }
 }
 
+fn display_path(path: &str) -> String {
+    if path.is_empty() || path == "-" {
+        return path.to_string();
+    }
+
+    let home = home_dir().to_string_lossy().to_string();
+    if path == home {
+        "~".to_string()
+    } else if let Some(suffix) = path.strip_prefix(&(home.clone() + "/")) {
+        format!("~/{}", suffix)
+    } else {
+        path.to_string()
+    }
+}
+
+fn display_paths(paths: &[String]) -> String {
+    if paths.is_empty() {
+        "-".to_string()
+    } else {
+        paths
+            .iter()
+            .map(|path| display_path(path))
+            .collect::<Vec<_>>()
+            .join(", ")
+    }
+}
+
 fn pane_title(base: &str, visible: usize, total: usize, filter: &str, editing: bool) -> String {
     let mut title = format!("{base} {visible}/{total}");
     let filter = trim_query(filter);
@@ -1073,6 +1368,21 @@ fn pane_title(base: &str, visible: usize, total: usize, filter: &str, editing: b
         title.push_str(" *");
     }
     title
+}
+
+fn version_row_text(version: &CatalogVersion, pane_width: u16) -> String {
+    let sha = version.commit_sha.chars().take(7).collect::<String>();
+    let prefix = format!("{} {}", version.version, sha);
+    let available_width = usize::from(pane_width.saturating_sub(3));
+    if available_width <= prefix.len() {
+        return truncate_inline(&prefix, available_width.max(1));
+    }
+    let subject_width = available_width.saturating_sub(prefix.len() + 1);
+    format!(
+        "{} {}",
+        prefix,
+        truncate_inline(&version.subject, subject_width)
+    )
 }
 
 fn centered_area(
@@ -1105,7 +1415,7 @@ fn render(app: &mut App, terminal: &mut Terminal<CrosstermBackend<Stdout>>) -> R
         let areas = Layout::default()
             .direction(Direction::Vertical)
             .constraints([
-                Constraint::Length(8),
+                Constraint::Length(9),
                 Constraint::Min(12),
                 Constraint::Length(11),
             ])
@@ -1166,6 +1476,7 @@ fn render(app: &mut App, terminal: &mut Terminal<CrosstermBackend<Stdout>>) -> R
                 app.current_track().name(),
                 if app.lofi.is_some() { "on" } else { "off" }
             )),
+            Line::from(global_default_summary_line(app)),
             Line::from(
                 format!(
                     "Search: projects=/{}, versions=/{}{}",
@@ -1180,7 +1491,7 @@ fn render(app: &mut App, terminal: &mut Terminal<CrosstermBackend<Stdout>>) -> R
                 ),
             ),
             Line::from(
-                "Keys: q quit | h help | g sync | / filter | f clear | m music | t track | c theme | tab switch | j/k move | ←/→ diff | d dry-run | a apply | b backup | z revert dry-run | x revert | r refresh",
+                "Keys: q quit | h help | s system | g sync | / filter | f clear | m music | t track | c theme | tab switch | j/k move | ←/→ diff | d dry-run | a apply | b backup | z revert dry-run | x revert | r refresh",
             ),
             Line::from(Span::styled(
                 app.status.clone(),
@@ -1216,7 +1527,7 @@ fn render(app: &mut App, terminal: &mut Terminal<CrosstermBackend<Stdout>>) -> R
                         "{} [{}] {}",
                         project.name,
                         project_status_label(project),
-                        project.canonical_path
+                        display_path(&project.canonical_path)
                     ))
                 })
                 .collect::<Vec<_>>()
@@ -1242,14 +1553,7 @@ fn render(app: &mut App, terminal: &mut Terminal<CrosstermBackend<Stdout>>) -> R
         } else {
             app.versions
                 .iter()
-                .map(|version| {
-                    ListItem::new(format!(
-                        "{} {} {}",
-                        version.version,
-                        version.commit_sha.chars().take(12).collect::<String>(),
-                        truncate_inline(&version.subject, 44)
-                    ))
-                })
+                .map(|version| ListItem::new(version_row_text(version, middle[1].width)))
                 .collect::<Vec<_>>()
         };
         let versions_title = pane_title(
@@ -1278,7 +1582,21 @@ fn render(app: &mut App, terminal: &mut Terminal<CrosstermBackend<Stdout>>) -> R
             .wrap(Wrap { trim: true });
         frame.render_widget(detail, areas[2]);
 
-        if app.show_help {
+        if app.show_bootstrap {
+            let bootstrap_area = centered_area(frame.area(), 68, 64);
+            let bootstrap = Paragraph::new(build_bootstrap_lines(app, theme))
+                .block(block("Bootstrap", theme, true))
+                .wrap(Wrap { trim: true });
+            frame.render_widget(Clear, bootstrap_area);
+            frame.render_widget(bootstrap, bootstrap_area);
+        } else if app.show_system {
+            let system_area = centered_area(frame.area(), 72, 72);
+            let system = Paragraph::new(build_system_lines(app, theme))
+                .block(block("System", theme, true))
+                .wrap(Wrap { trim: true });
+            frame.render_widget(Clear, system_area);
+            frame.render_widget(system, system_area);
+        } else if app.show_help {
             let help_area = centered_area(frame.area(), 62, 68);
             let help = Paragraph::new(build_help_lines(app, theme))
                 .block(block("Help", theme, true))
@@ -1342,6 +1660,235 @@ fn build_visualizer_lines(app: &App, theme: Theme) -> Vec<Line<'static>> {
     lines
 }
 
+fn tool_presence_line(
+    label: &str,
+    installed: bool,
+    path: Option<&str>,
+    theme: Theme,
+) -> Line<'static> {
+    let value = if installed { "installed" } else { "missing" };
+    Line::from(vec![
+        Span::styled(format!("{label}: "), Style::default().fg(theme.muted)),
+        Span::styled(
+            value.to_string(),
+            Style::default().fg(if installed {
+                theme.accent
+            } else {
+                Color::LightRed
+            }),
+        ),
+        Span::raw("  "),
+        Span::styled(
+            path.map(display_path).unwrap_or_else(|| "-".to_string()),
+            Style::default().fg(theme.text),
+        ),
+    ])
+}
+
+fn global_default_compact_value(status: &GlobalDefaultStatus) -> String {
+    if !status.installed {
+        return "not set".to_string();
+    }
+    status
+        .matched_upstream_version
+        .clone()
+        .or_else(|| status.local_version.clone())
+        .or_else(|| {
+            status
+                .matched_upstream_commit_sha
+                .as_ref()
+                .map(|sha| sha.chars().take(12).collect::<String>())
+        })
+        .unwrap_or_else(|| "installed".to_string())
+}
+
+fn global_default_summary_line(app: &App) -> String {
+    let claude = app
+        .system_defaults
+        .iter()
+        .find(|status| status.host == "claude")
+        .map(global_default_compact_value)
+        .unwrap_or_else(|| "unknown".to_string());
+    let codex = app
+        .system_defaults
+        .iter()
+        .find(|status| status.host == "codex")
+        .map(global_default_compact_value)
+        .unwrap_or_else(|| "unknown".to_string());
+    format!("Defaults: Claude {claude}  Codex {codex}")
+}
+
+fn build_system_lines(app: &App, theme: Theme) -> Vec<Line<'static>> {
+    let selected_target = app.system_target.label();
+    let selected_version = app
+        .selected_version()
+        .map(|version| {
+            format!(
+                "{} ({})",
+                version.version,
+                version.commit_sha.chars().take(12).collect::<String>()
+            )
+        })
+        .or_else(|| {
+            app.summary.source.head_version.as_ref().map(|version| {
+                format!(
+                    "{} ({})",
+                    version,
+                    app.summary
+                        .source
+                        .head_commit_sha
+                        .as_ref()
+                        .map(|sha| sha.chars().take(12).collect::<String>())
+                        .unwrap_or_else(|| "none".to_string())
+                )
+            })
+        })
+        .unwrap_or_else(|| "no upstream version selected".to_string());
+
+    let mut lines = vec![
+        Line::from(Span::styled(
+            "Global gstack defaults for Claude and Codex.",
+            Style::default()
+                .fg(theme.accent_soft)
+                .add_modifier(Modifier::BOLD),
+        )),
+        Line::from(""),
+        Line::from(Span::styled(
+            global_default_summary_line(app),
+            Style::default()
+                .fg(theme.accent)
+                .add_modifier(Modifier::BOLD),
+        )),
+        Line::from(""),
+        Line::from(format!("Selected target: {selected_target}")),
+        Line::from(format!("Selected version: {selected_version}")),
+        Line::from(""),
+        Line::from("Global defaults"),
+    ];
+
+    if app.system_defaults.is_empty() {
+        lines.push(Line::from("  No global install state cataloged yet."));
+    } else {
+        for status in &app.system_defaults {
+            let host_label = match status.host.as_str() {
+                "claude" => "Claude",
+                "codex" => "Codex",
+                _ => &status.host,
+            };
+            lines.push(Line::from(format!(
+                "  {host_label} current: {}",
+                global_default_compact_value(status),
+            )));
+            lines.push(Line::from(format!(
+                "    path={} outdated={} dirty={}",
+                display_path(&status.install_path),
+                status
+                    .is_outdated
+                    .map(|value| value.to_string())
+                    .unwrap_or_else(|| "unknown".to_string()),
+                status.dirty,
+            )));
+            if let Some(commit_sha) = status.matched_upstream_commit_sha.as_ref() {
+                lines.push(Line::from(format!(
+                    "    upstream={} ({})",
+                    status
+                        .matched_upstream_version
+                        .clone()
+                        .unwrap_or_else(|| "unmapped".to_string()),
+                    commit_sha.chars().take(12).collect::<String>()
+                )));
+            }
+        }
+    }
+
+    lines.push(Line::from(""));
+    lines.push(Line::from("Runtime"));
+    lines.push(tool_presence_line(
+        "Bun",
+        app.runtime_status.bun.installed,
+        app.runtime_status.bun.path.as_deref(),
+        theme,
+    ));
+    lines.push(tool_presence_line(
+        "Claude CLI",
+        app.runtime_status.claude.installed,
+        app.runtime_status.claude.path.as_deref(),
+        theme,
+    ));
+    lines.push(tool_presence_line(
+        "Codex CLI",
+        app.runtime_status.codex.installed,
+        app.runtime_status.codex.path.as_deref(),
+        theme,
+    ));
+    lines.push(Line::from(""));
+    lines.push(Line::from("Keys"));
+    lines.push(Line::from(
+        "  1 Claude | 2 Codex | 3 Both selects which global default target to update.",
+    ));
+    lines.push(Line::from(
+        "  d dry-runs the selected version globally. a applies it globally.",
+    ));
+    lines.push(Line::from(
+        "  i retries Bun/agent bootstrap if Bun or both agent CLIs are missing.",
+    ));
+    lines.push(Line::from(
+        "  r refreshes system status. s, enter, or esc closes this modal.",
+    ));
+    lines
+}
+
+fn build_bootstrap_lines(app: &App, theme: Theme) -> Vec<Line<'static>> {
+    let mut lines = vec![
+        Line::from(Span::styled(
+            "Bootstrap local agent tooling",
+            Style::default()
+                .fg(theme.accent_soft)
+                .add_modifier(Modifier::BOLD),
+        )),
+        Line::from(""),
+        Line::from(
+            "Bun is required for local agent bootstrap and is installed automatically when missing.",
+        ),
+        tool_presence_line(
+            "Bun",
+            app.runtime_status.bun.installed,
+            app.runtime_status.bun.path.as_deref(),
+            theme,
+        ),
+        tool_presence_line(
+            "Claude CLI",
+            app.runtime_status.claude.installed,
+            app.runtime_status.claude.path.as_deref(),
+            theme,
+        ),
+        tool_presence_line(
+            "Codex CLI",
+            app.runtime_status.codex.installed,
+            app.runtime_status.codex.path.as_deref(),
+            theme,
+        ),
+        Line::from(""),
+        Line::from(format!(
+            "Selection when neither agent is installed: {}",
+            app.bootstrap_target.label()
+        )),
+        Line::from("Keys: 0 none | 1 claude | 2 codex | 3 both | enter or i install | esc dismiss"),
+        Line::from(""),
+        Line::from("Recent bootstrap log"),
+    ];
+
+    if app.bootstrap_log.is_empty() {
+        lines.push(Line::from("  No bootstrap actions have run yet."));
+    } else {
+        for line in app.bootstrap_log.iter().rev().take(10).rev() {
+            lines.push(Line::from(format!("  {}", truncate_inline(line, 92))));
+        }
+    }
+
+    lines
+}
+
 fn build_help_lines(app: &App, theme: Theme) -> Vec<Line<'static>> {
     let focus_label = app.focus.label();
     let project_filter = display_filter(&app.project_filter);
@@ -1378,6 +1925,9 @@ fn build_help_lines(app: &App, theme: Theme) -> Vec<Line<'static>> {
         Line::from("  g syncs upstream gstack history and rescans local projects."),
         Line::from("  d dry-runs the selected version against the selected project."),
         Line::from("  a applies the selected version with merge-aware updates and backups."),
+        Line::from(
+            "  s opens the System modal for global Claude/Codex defaults and bootstrap state.",
+        ),
         Line::from("  b cycles backup-history entries for the selected project."),
         Line::from("  z dry-runs a revert from the selected backup entry."),
         Line::from("  x restores the selected backup entry and creates a new backup first."),
@@ -1401,6 +1951,9 @@ fn build_help_lines(app: &App, theme: Theme) -> Vec<Line<'static>> {
         ),
         Line::from(
             "  Project Detail shows install state, selected backup history, and the current revert/apply target.",
+        ),
+        Line::from(
+            "  System modal shows runtime tooling, global Claude/Codex defaults, and lets you apply the selected version globally.",
         ),
     ]
 }
@@ -1573,7 +2126,7 @@ fn build_project_detail(app: &App, theme: Theme) -> Vec<Line<'static>> {
     let context = app.version_context.as_ref();
     let mut lines = vec![
         Line::from(format!("Project: {}", project.name)),
-        Line::from(format!("Path: {}", project.canonical_path)),
+        Line::from(format!("Path: {}", display_path(&project.canonical_path))),
         Line::from(format!(
             "Repository: git_repo={} remote={}",
             project.has_git_repo,
@@ -1587,11 +2140,7 @@ fn build_project_detail(app: &App, theme: Theme) -> Vec<Line<'static>> {
             project.has_claude_md,
             project.has_claude_dir,
             project.has_claude_settings,
-            if project.claude_settings_paths.is_empty() {
-                "-".to_string()
-            } else {
-                project.claude_settings_paths.join(", ")
-            }
+            display_paths(&project.claude_settings_paths)
         )),
         Line::from(format!(
             "Codex markers: AGENTS.md={} .codex={} .agents={} settings={} paths={}",
@@ -1599,11 +2148,7 @@ fn build_project_detail(app: &App, theme: Theme) -> Vec<Line<'static>> {
             project.has_codex_dir,
             project.has_agents_dir,
             project.has_codex_settings,
-            if project.codex_settings_paths.is_empty() {
-                "-".to_string()
-            } else {
-                project.codex_settings_paths.join(", ")
-            }
+            display_paths(&project.codex_settings_paths)
         )),
         Line::from(project_current_gstack_line(project)),
         Line::from(format!(
@@ -1723,6 +2268,42 @@ fn run_loop(app: &mut App, terminal: &mut Terminal<CrosstermBackend<Stdout>>) ->
         render(app, terminal)?;
         if event::poll(Duration::from_millis(100))? {
             if let Event::Key(key) = event::read()? {
+                if app.show_bootstrap {
+                    match key.code {
+                        KeyCode::Char('0') => app.set_bootstrap_target(BootstrapTarget::None),
+                        KeyCode::Char('1') => app.set_bootstrap_target(BootstrapTarget::Claude),
+                        KeyCode::Char('2') => app.set_bootstrap_target(BootstrapTarget::Codex),
+                        KeyCode::Char('3') => app.set_bootstrap_target(BootstrapTarget::Both),
+                        KeyCode::Tab => app.cycle_bootstrap_target(),
+                        KeyCode::Char('i') | KeyCode::Enter => app.run_bootstrap_install(),
+                        KeyCode::Esc => app.dismiss_bootstrap(),
+                        _ => {}
+                    }
+                    continue;
+                }
+
+                if app.show_system {
+                    match key.code {
+                        KeyCode::Char('1') => app.set_system_target(SystemTarget::Claude),
+                        KeyCode::Char('2') => app.set_system_target(SystemTarget::Codex),
+                        KeyCode::Char('3') => app.set_system_target(SystemTarget::Both),
+                        KeyCode::Tab => app.cycle_system_target(),
+                        KeyCode::Char('d') => app.apply_system_selected(true),
+                        KeyCode::Char('a') => app.apply_system_selected(false),
+                        KeyCode::Char('i') => app.run_bootstrap_install(),
+                        KeyCode::Char('r') => {
+                            if let Err(error) = app.refresh_system_state() {
+                                app.status = format!("system refresh failed: {error}");
+                            } else {
+                                app.status = "system status refreshed".to_string();
+                            }
+                        }
+                        KeyCode::Char('s') | KeyCode::Esc | KeyCode::Enter => app.toggle_system(),
+                        _ => {}
+                    }
+                    continue;
+                }
+
                 if app.show_help {
                     match key.code {
                         KeyCode::Char('h') | KeyCode::Char('?') | KeyCode::Esc | KeyCode::Enter => {
@@ -1737,6 +2318,7 @@ fn run_loop(app: &mut App, terminal: &mut Terminal<CrosstermBackend<Stdout>>) ->
                     InputMode::Normal => match key.code {
                         KeyCode::Char('q') => break,
                         KeyCode::Char('h') | KeyCode::Char('?') => app.toggle_help(),
+                        KeyCode::Char('s') => app.toggle_system(),
                         KeyCode::Char('g') => app.sync_now(),
                         KeyCode::Char('/') => app.begin_filter(),
                         KeyCode::Char('f') => app.clear_filter(app.focus),
@@ -1791,7 +2373,8 @@ pub fn run(catalog: Catalog) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{filter_projects, filter_versions, project_status_label};
+    use super::{display_path, filter_projects, filter_versions, project_status_label};
+    use crate::config::home_dir;
     use crate::models::{CatalogProject, CatalogVersion};
 
     fn sample_project(
@@ -1858,6 +2441,14 @@ mod tests {
         assert_eq!(filter_projects(&projects, "startup 0.11.10").len(), 1);
         assert_eq!(filter_projects(&projects, "Work local_install").len(), 1);
         assert!(filter_projects(&projects, "missing value").is_empty());
+    }
+
+    #[test]
+    fn display_path_collapses_home_prefix() {
+        let home = home_dir().to_string_lossy().to_string();
+        assert_eq!(display_path(&home), "~");
+        assert_eq!(display_path(&format!("{home}/Work/repo")), "~/Work/repo");
+        assert_eq!(display_path("/tmp/repo"), "/tmp/repo");
     }
 
     #[test]

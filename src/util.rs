@@ -17,7 +17,15 @@ pub fn ensure_dir(path: &Path) -> Result<()> {
 pub fn read_trimmed_file(path: &Path) -> Option<String> {
     fs::read_to_string(path)
         .ok()
-        .map(|value| value.trim().to_string())
+        .and_then(|value| {
+            let filtered = value.lines().map(str::trim).find(|line| {
+                !line.is_empty()
+                    && !line.starts_with("<<<<<<<")
+                    && !line.starts_with("=======")
+                    && !line.starts_with(">>>>>>>")
+            })?;
+            Some(filtered.to_string())
+        })
         .filter(|value| !value.is_empty())
 }
 
@@ -129,7 +137,9 @@ impl Drop for TempWorkdir {
 
 #[cfg(test)]
 mod tests {
-    use super::TempWorkdir;
+    use std::fs;
+
+    use super::{TempWorkdir, read_trimmed_file};
 
     #[test]
     fn temp_workdirs_are_unique() {
@@ -139,5 +149,19 @@ mod tests {
         assert_ne!(first.path(), second.path());
         assert!(first.path().exists());
         assert!(second.path().exists());
+    }
+
+    #[test]
+    fn read_trimmed_file_skips_merge_markers() {
+        let temp = TempWorkdir::new("gstackqlite-hypervisor-read-trimmed-test").expect("temp dir");
+        let file = temp.path().join("VERSION");
+        fs::write(
+            &file,
+            "<<<<<<< local customization\n0.11.11.0\n=======\n0.11.14.0\n>>>>>>> gstack 0.11.14.0\n",
+        )
+        .expect("write version fixture");
+
+        let value = read_trimmed_file(&file).expect("parsed version");
+        assert_eq!(value, "0.11.11.0");
     }
 }

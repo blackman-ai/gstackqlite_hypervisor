@@ -8,11 +8,12 @@ use gstackqlite_hypervisor::db::Catalog;
 use gstackqlite_hypervisor::ideas::build_ideas;
 use gstackqlite_hypervisor::ingest::{ensure_catalog_has_upstream, ingest_upstream};
 use gstackqlite_hypervisor::mcp;
+use gstackqlite_hypervisor::models::HostKind;
 use gstackqlite_hypervisor::scan::{scan_local_installs, sync_catalog};
 use gstackqlite_hypervisor::tui;
 use gstackqlite_hypervisor::upgrade::{
-    apply_version_to_projects, materialize_targets, project_diff_preview, remove_projects,
-    revert_projects,
+    apply_version_to_projects, global_default_statuses, materialize_targets, project_diff_preview,
+    remove_projects, revert_projects, set_global_default_version,
 };
 use gstackqlite_hypervisor::util::default_db_path;
 
@@ -128,6 +129,10 @@ enum Command {
         #[arg(long)]
         json: bool,
     },
+    Default {
+        #[command(subcommand)]
+        command: DefaultCommand,
+    },
     Inspect {
         identifier: String,
     },
@@ -155,6 +160,28 @@ enum Command {
 }
 
 #[derive(Subcommand)]
+enum DefaultCommand {
+    Status {
+        #[arg(long, value_enum, default_value_t = AgentSelection::Both)]
+        agent: AgentSelection,
+        #[arg(long)]
+        json: bool,
+    },
+    Set {
+        #[arg(long, value_enum, default_value_t = AgentSelection::Both)]
+        agent: AgentSelection,
+        #[arg(long, conflicts_with = "version")]
+        commit: Option<String>,
+        #[arg(long, conflicts_with = "commit")]
+        version: Option<String>,
+        #[arg(long)]
+        dry_run: bool,
+        #[arg(long)]
+        json: bool,
+    },
+}
+
+#[derive(Subcommand)]
 enum McpCommand {
     Serve,
     Install {
@@ -162,7 +189,7 @@ enum McpCommand {
         global: bool,
         #[arg(long)]
         project: Option<String>,
-        #[arg(long, value_enum, default_value_t = AgentSelection::All)]
+        #[arg(long, value_enum, default_value_t = AgentSelection::Both)]
         agent: AgentSelection,
         #[arg(long)]
         json: bool,
@@ -172,7 +199,7 @@ enum McpCommand {
         global: bool,
         #[arg(long)]
         project: Option<String>,
-        #[arg(long, value_enum, default_value_t = AgentSelection::All)]
+        #[arg(long, value_enum, default_value_t = AgentSelection::Both)]
         agent: AgentSelection,
         #[arg(long)]
         json: bool,
@@ -182,7 +209,7 @@ enum McpCommand {
         global: bool,
         #[arg(long)]
         project: Option<String>,
-        #[arg(long, value_enum, default_value_t = AgentSelection::All)]
+        #[arg(long, value_enum, default_value_t = AgentSelection::Both)]
         agent: AgentSelection,
         #[arg(long)]
         json: bool,
@@ -191,7 +218,7 @@ enum McpCommand {
 
 #[derive(Clone, Copy, Debug, ValueEnum)]
 enum AgentSelection {
-    All,
+    Both,
     Claude,
     Codex,
 }
@@ -213,9 +240,17 @@ fn resolve_roots(roots: Vec<PathBuf>) -> Vec<PathBuf> {
 
 fn selected_agents(selection: AgentSelection) -> Vec<mcp::McpAgent> {
     match selection {
-        AgentSelection::All => vec![mcp::McpAgent::Claude, mcp::McpAgent::Codex],
+        AgentSelection::Both => vec![mcp::McpAgent::Claude, mcp::McpAgent::Codex],
         AgentSelection::Claude => vec![mcp::McpAgent::Claude],
         AgentSelection::Codex => vec![mcp::McpAgent::Codex],
+    }
+}
+
+fn selected_hosts(selection: AgentSelection) -> Vec<HostKind> {
+    match selection {
+        AgentSelection::Both => vec![HostKind::Claude, HostKind::Codex],
+        AgentSelection::Claude => vec![HostKind::Claude],
+        AgentSelection::Codex => vec![HostKind::Codex],
     }
 }
 
@@ -550,6 +585,75 @@ fn main() -> Result<()> {
                 }
             }
         }
+        Some(Command::Default { command }) => match command {
+            DefaultCommand::Status { agent, json } => {
+                let statuses = global_default_statuses(&catalog, &selected_hosts(agent))?;
+                if json {
+                    print_json(&statuses);
+                } else {
+                    for status in statuses {
+                        println!(
+                            "{} installed={} local={} matched={} outdated={} dirty={} git={} path={}",
+                            status.host,
+                            status.installed,
+                            status.local_version.unwrap_or_else(|| "-".to_string()),
+                            status
+                                .matched_upstream_version
+                                .or(status
+                                    .matched_upstream_commit_sha
+                                    .map(|sha| { sha.chars().take(12).collect::<String>() }))
+                                .unwrap_or_else(|| "-".to_string()),
+                            status
+                                .is_outdated
+                                .map(|value| value.to_string())
+                                .unwrap_or_else(|| "unknown".to_string()),
+                            status.dirty,
+                            status.has_git,
+                            status.install_path
+                        );
+                    }
+                }
+            }
+            DefaultCommand::Set {
+                agent,
+                commit,
+                version,
+                dry_run,
+                json,
+            } => {
+                ensure_catalog_has_upstream(&catalog)?;
+                let results = set_global_default_version(
+                    &catalog,
+                    &selected_hosts(agent),
+                    version.as_deref(),
+                    commit.as_deref(),
+                    dry_run,
+                )?;
+                if json {
+                    print_json(&results);
+                } else {
+                    for result in results {
+                        println!(
+                            "{} host={} version={} applied={} merged={} conflicts={} preserved={} removed={} backup={} path={}",
+                            result.status,
+                            result.host,
+                            result.version.unwrap_or_else(|| result
+                                .commit_sha
+                                .chars()
+                                .take(12)
+                                .collect()),
+                            result.applied_files.len(),
+                            result.merged_files.len(),
+                            result.conflict_files.len(),
+                            result.preserved_local_files.len(),
+                            result.removed_files.len(),
+                            result.backup_path.unwrap_or_else(|| "-".to_string()),
+                            result.install_path
+                        );
+                    }
+                }
+            }
+        },
         Some(Command::Inspect { identifier }) => {
             let Some(detail) = catalog.install_detail(&identifier)? else {
                 bail!("install not found: {identifier}");

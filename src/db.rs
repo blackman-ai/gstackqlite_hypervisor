@@ -4,14 +4,17 @@ use anyhow::{Context, Result};
 use rusqlite::{Connection, OptionalExtension, params};
 use serde_json::{Value, json};
 
-use crate::config::{DEFAULT_SOURCE_NAME, DEFAULT_UPSTREAM_REF, DEFAULT_UPSTREAM_URL};
+use crate::config::{
+    DEFAULT_SOURCE_NAME, DEFAULT_UPSTREAM_REF, DEFAULT_UPSTREAM_URL, home_dir,
+    known_install_locations,
+};
 use crate::models::{
     CatalogCommitDiff, CatalogCommitNote, CatalogInstall, CatalogObservation, CatalogProject,
     CatalogSummary, CatalogSyncEvent, CatalogVersion, CatalogVersionContext, CommitSnapshotFile,
     DiscoveredInstall, DiscoveredProject, HostKind, InstallDetail, InstallType, ProjectDetail,
     ScanResult, SourceState, UpstreamCommitRecord, UpstreamTreeEntry,
 };
-use crate::util::{ensure_dir, now_iso};
+use crate::util::{ensure_dir, now_iso, real_path_or_original};
 
 pub struct Catalog {
     pub path: PathBuf,
@@ -24,6 +27,40 @@ fn bool_to_sql(value: bool) -> i64 {
 
 fn sql_to_bool(value: Option<i64>) -> Option<bool> {
     value.map(|flag| flag != 0)
+}
+
+fn should_hide_project(project: &CatalogProject) -> bool {
+    if project.has_git_repo || project.has_claude_md || project.has_agents_md {
+        return false;
+    }
+
+    let canonical_home = real_path_or_original(&home_dir())
+        .to_string_lossy()
+        .to_string();
+    if project.canonical_path != canonical_home {
+        return false;
+    }
+
+    let known_install_paths = known_install_locations()
+        .into_iter()
+        .flat_map(|path| {
+            let original = path.to_string_lossy().to_string();
+            let resolved = real_path_or_original(&path).to_string_lossy().to_string();
+            if original == resolved {
+                vec![original]
+            } else {
+                vec![original, resolved]
+            }
+        })
+        .collect::<Vec<_>>();
+    project
+        .gstack_install_observed_path
+        .as_ref()
+        .is_some_and(|path| {
+            known_install_paths
+                .iter()
+                .any(|candidate| candidate == path)
+        })
 }
 
 impl Catalog {
@@ -1054,7 +1091,11 @@ impl Catalog {
         })?;
         let mut projects = Vec::new();
         for row in rows {
-            projects.push(row?);
+            let project = row?;
+            if should_hide_project(&project) {
+                continue;
+            }
+            projects.push(project);
         }
         Ok(projects)
     }
@@ -1402,14 +1443,12 @@ impl Catalog {
             [],
             |row| row.get(0),
         )?;
-        let total_projects: i64 =
-            self.conn
-                .query_row("SELECT COUNT(*) FROM projects", [], |row| row.get(0))?;
-        let projects_with_local_gstack: i64 = self.conn.query_row(
-            "SELECT COUNT(*) FROM projects WHERE effective_gstack_source = 'local_install'",
-            [],
-            |row| row.get(0),
-        )?;
+        let visible_projects = self.list_projects()?;
+        let total_projects = visible_projects.len() as i64;
+        let projects_with_local_gstack = visible_projects
+            .iter()
+            .filter(|project| project.effective_gstack_source == "local_install")
+            .count() as i64;
         let mut statement = self
             .conn
             .prepare("SELECT install_type, COUNT(*) FROM local_installs GROUP BY install_type ORDER BY install_type")?;
@@ -1441,7 +1480,9 @@ impl Catalog {
 
 #[cfg(test)]
 mod tests {
-    use super::Catalog;
+    use super::{Catalog, should_hide_project};
+    use crate::config::{home_dir, known_install_locations};
+    use crate::models::CatalogProject;
     use crate::util::TempWorkdir;
 
     #[test]
@@ -1464,5 +1505,47 @@ mod tests {
             .set_app_setting("tui.theme_id", None)
             .expect("delete");
         assert_eq!(catalog.app_setting("tui.theme_id").expect("read"), None);
+    }
+
+    #[test]
+    fn hides_home_directory_agent_artifact_project() {
+        let project = CatalogProject {
+            id: 1,
+            canonical_path: home_dir().to_string_lossy().to_string(),
+            name: "home".to_string(),
+            git_remote: None,
+            has_git_repo: false,
+            has_claude_md: false,
+            has_claude_dir: true,
+            has_claude_settings: true,
+            claude_settings_paths: vec![
+                home_dir()
+                    .join(".claude")
+                    .join("settings.json")
+                    .to_string_lossy()
+                    .to_string(),
+            ],
+            has_agents_md: false,
+            has_agents_dir: false,
+            has_codex_dir: true,
+            has_codex_settings: true,
+            codex_settings_paths: vec![
+                home_dir()
+                    .join(".codex")
+                    .join("config.toml")
+                    .to_string_lossy()
+                    .to_string(),
+            ],
+            gstack_install_id: Some(1),
+            gstack_install_observed_path: Some(
+                known_install_locations()[0].to_string_lossy().to_string(),
+            ),
+            effective_gstack_version: Some("0.11.17.0".to_string()),
+            effective_gstack_source: "local_install".to_string(),
+            first_seen_at: "2026-03-25T00:00:00Z".to_string(),
+            last_seen_at: "2026-03-25T00:00:00Z".to_string(),
+        };
+
+        assert!(should_hide_project(&project));
     }
 }
